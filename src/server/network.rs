@@ -148,6 +148,20 @@ impl Network {
         })
     }
 
+    pub fn peer_outbox(&self, id: NodeId) -> UnboundedSender<ClusterMessage>{
+        self.peer_connections
+        .iter()
+        .find_map(|slot| {
+            let conn = slot.as_ref()?;
+            if conn.peer_id == id {
+                return Some(conn.outgoing_messages.clone());
+            } else {
+                None
+            }
+        })
+        .expect("peer_outbox: no connection found on node {id}")
+    }
+
     async fn handle_incoming_connection(
         connection: TcpStream,
         client_message_sender: Sender<(ClientId, ClientMessage)>,

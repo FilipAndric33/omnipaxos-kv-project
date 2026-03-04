@@ -8,7 +8,9 @@ use omnipaxos::{
 };
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
-use std::{fs::File, io::Write, time::Duration};
+use std::{fs::File, io::Write, time::{Duration, SystemTime}};
+use super::clock::*;
+use super::proxy::*;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
@@ -16,14 +18,16 @@ const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct OmniPaxosServer {
-    id: NodeId,
+    pub id: NodeId,
     database: Database,
     network: Network,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
+    pub peers: Vec<NodeId>,
+    pub clock: Clock,
     config: OmniPaxosKVConfig,
-    peers: Vec<NodeId>,
+    proxy: Option<Proxy>
 }
 
 impl OmniPaxosServer {
@@ -42,8 +46,10 @@ impl OmniPaxosServer {
             omnipaxos,
             current_decided_idx: 0,
             omnipaxos_msg_buffer,
-            peers: config.get_peers(config.local.server_id),
+            peers: config.get_peers(config.local.server_id), 
+            clock: Clock::new(config.local.server_id, 0.0, Duration::new(0, 10), Duration::new(10, 0), 1000),
             config,
+            proxy: None
         }
     }
 
@@ -62,6 +68,14 @@ impl OmniPaxosServer {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
                     self.send_outgoing_msgs();
+
+                    if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader() {
+                        if is_accept_phase {
+                            if curr_leader == self.id && self.proxy.is_none() {
+                                self.proxy = Some(Proxy::new(self.id.clone(), self.peers.clone(), &mut self.network));
+                            }
+                        }
+                    }
                 },
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE) => {
                     self.handle_cluster_messages(&mut cluster_msg_buf).await;
@@ -91,6 +105,7 @@ impl OmniPaxosServer {
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start);
                             self.send_client_start_signals(experiment_sync_start);
+                            self.proxy = Some(Proxy::new(self.id.clone(), self.peers.clone(), &mut self.network));
                             break;
                         }
                     }
@@ -158,20 +173,28 @@ impl OmniPaxosServer {
 
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
+            if let Some(proxy) = &self.proxy {
+                        debug!("Leader here");
+                        proxy.forward_client_message(from, message.clone());
+                    }
             match message {
-                ClientMessage::Append(command_id, kv_command) => {
-                    self.append_to_log(from, command_id, kv_command)
+                ClientMessage::Append(_, _) => {
+                    self.handle_single_client_message(from, message);
                 }
             }
         }
-        self.send_outgoing_msgs();
+            self.send_outgoing_msgs();
+    }
+
+    fn handle_single_client_message(&self, from: ClientId, msg: ClientMessage) {
+        debug!("here")
     }
 
     async fn handle_cluster_messages(
         &mut self,
         messages: &mut Vec<(NodeId, ClusterMessage)>,
     ) -> bool {
-        let mut received_start_signal = false;
+        let mut received_start_signal = false; 
         for (from, message) in messages.drain(..) {
             trace!("{}: Received {message:?}", self.id);
             match message {
@@ -184,11 +207,25 @@ impl OmniPaxosServer {
                     received_start_signal = true;
                     self.send_client_start_signals(start_time);
                 }
+                ClusterMessage::LeaderTime(from) => {
+                    let cur: SystemTime = self.clock.get_time();
+                    let msg = ClusterMessage::ClockResponse {
+                        real_time: cur
+                    };
+                    self.network.send_to_cluster(from, msg);
+                }
+                ClusterMessage::ClockResponse { real_time } => {
+                    self.clock.resync(real_time);
+                }
+                ClusterMessage::ForwardedClientMessage { client_id, msg} => { 
+                        self.handle_single_client_message(client_id, msg)
+                }
             }
         }
         self.send_outgoing_msgs();
         received_start_signal
     }
+
 
     fn append_to_log(&mut self, from: ClientId, command_id: CommandId, kv_command: KVCommand) {
         let command = Command {

@@ -1,4 +1,3 @@
-
 use log::*;
 use omnipaxos_kv::common::{
     kv::{ClientId, NodeId},

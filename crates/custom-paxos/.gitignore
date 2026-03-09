@@ -4,7 +4,7 @@
 Cargo.lock
 omnipaxos_storage/storage
 /omnipaxos/tests/config/storage/
-
+.rustfmt.toml
 # IntelliJ
 *.iml
 .idea/*

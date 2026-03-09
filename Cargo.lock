@@ -655,8 +655,12 @@ dependencies = [
 name = "omnipaxos"
 version = "0.2.2"
 dependencies = [
+ "futures",
+ "log",
  "omnipaxos_macros",
+ "rand",
  "serde",
+ "tokio",
  "toml 0.7.8",
 ]
 

@@ -59,7 +59,7 @@ where
                             .push(Message::SequencePaxos(PaxosMessage {
                                 from: mypid,
                                 to: proxy,
-                                msg: PaxosMsg::Ack(req.get_id(), hash, speculation, accepted_idx),
+                                msg: PaxosMsg::Ack(req, hash, speculation, accepted_idx),
                             }))
                     }
                     Err(e) => {

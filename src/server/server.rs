@@ -2,6 +2,7 @@ use super::proxy::*;
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
+use omnipaxos::clock::*;
 use omnipaxos::{
     OmniPaxos, OmniPaxosConfig,
     clock::*,
@@ -32,7 +33,6 @@ pub struct OmniPaxosServer {
     pub peers: Vec<NodeId>,
     pub clock: Clock,
     config: OmniPaxosKVConfig,
-    proxy: Option<Proxy>,
 }
 
 impl OmniPaxosServer {
@@ -64,7 +64,6 @@ impl OmniPaxosServer {
             peers: config.get_peers(config.local.server_id),
             clock,
             config,
-            proxy: None,
         }
     }
 
@@ -84,13 +83,14 @@ impl OmniPaxosServer {
                     self.omnipaxos.tick().await;
                     self.send_outgoing_msgs().await;
 
-                    if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader().await {
+                    /*
+                    if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader() {
                         if is_accept_phase {
                             if curr_leader == self.id && self.proxy.is_none() {
                                 self.proxy = Some(Proxy::new(self.id.clone(), self.peers.clone(), &mut self.network));
                             }
                         }
-                    }
+                    }*/
                 },
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE) => {
                     self.handle_cluster_messages(&mut cluster_msg_buf).await;
@@ -120,7 +120,6 @@ impl OmniPaxosServer {
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start);
                             self.send_client_start_signals(experiment_sync_start);
-                            self.proxy = Some(Proxy::new(self.id.clone(), self.peers.clone(), &mut self.network));
                             break;
                         }
                     }
@@ -194,14 +193,9 @@ impl OmniPaxosServer {
 
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
-            if let Some(proxy) = &self.proxy {
-                debug!("Leader here");
-                proxy.forward_client_message(from, message.clone());
-            } else {
-                match message {
-                    ClientMessage::Append(_, _) => {
-                        self.handle_single_client_message(from, message);
-                    }
+            match message {
+                ClientMessage::Append(_, _) => {
+                    self.handle_single_client_message(from, message);
                 }
             }
         }

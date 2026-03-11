@@ -310,7 +310,7 @@ enum NewConnection {
     ToClient(ClientConnection),
 }
 
-struct PeerConnection {
+pub struct PeerConnection {
     peer_id: NodeId,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
@@ -382,7 +382,7 @@ impl PeerConnection {
     }
 }
 
-struct ClientConnection {
+pub struct ClientConnection {
     client_id: ClientId,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,

@@ -1,0 +1,16 @@
+* TODO I added a todo in server/server.rs
+* TODO Late buffer logic
+* DONE Implement log logic
+* DONE Implement speculation on the server
+* DONE Implement execution on the server
+* DONE Implement deadline for the commands
+* DONE Add hash computation
+* DONE Add the command to the log when we return the ack
+* DONE Implement the full nazha protocol
+** DONE The entry point
+We take the command T, fetch it's deadline, insert it into the buffers.
+** DONE The wait spammer
+In a separate thread, we constantly wait for buffers realease, and we generate answer ack to the proxy with our historic hash.
+Leader has to speculate.
+** DONE The executer
+Should be activated through an ingoing message, and just tell the server somehow to execute the command.

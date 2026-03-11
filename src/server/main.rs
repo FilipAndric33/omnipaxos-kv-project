@@ -4,9 +4,8 @@ use env_logger;
 mod configs;
 mod database;
 mod network;
-mod server;
-mod clock;
 mod proxy;
+mod server;
 
 #[tokio::main]
 pub async fn main() {

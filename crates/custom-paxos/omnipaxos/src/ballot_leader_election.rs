@@ -3,22 +3,22 @@ use std::cmp::Ordering;
 /// Ballot Leader Election algorithm for electing new leaders
 use crate::{
     sequence_paxos::{Phase, Role},
-    util::{defaults::*, ConfigurationId, FlexibleQuorum, Quorum},
+    util::{ConfigurationId, FlexibleQuorum, Quorum, defaults::*},
 };
 
 #[cfg(feature = "logging")]
 use crate::utils::logger::create_logger;
 use crate::{
+    OmniPaxosConfig,
     messages::ballot_leader_election::{
         BLEMessage, HeartbeatMsg, HeartbeatReply, HeartbeatRequest,
     },
     util::NodeId,
-    OmniPaxosConfig,
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "logging")]
-use slog::{info, trace, Logger};
+use slog::{Logger, info, trace};
 
 /// Used to define a Sequence Paxos epoch
 #[derive(Clone, Copy, Eq, Debug, Default, PartialEq)]
@@ -178,8 +178,7 @@ impl BallotLeaderElection {
         #[cfg(feature = "logging")]
         trace!(
             self.logger,
-            "Initiate new heartbeat round: {}",
-            self.hb_round
+            "Initiate new heartbeat round: {}", self.hb_round
         );
         for peer in &self.peers {
             let hb_request = HeartbeatRequest {
@@ -297,6 +296,7 @@ impl BallotLeaderElection {
         self.current_ballot
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_ballots(&self) -> Vec<HeartbeatReply> {
         self.prev_replies.clone()
     }

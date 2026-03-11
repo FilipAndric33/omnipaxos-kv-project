@@ -1,4 +1,4 @@
-use super::{internal_storage::InternalStorageConfig, Entry, StopSign};
+use super::{Entry, StopSign, internal_storage::InternalStorageConfig};
 use crate::ballot_leader_election::Ballot;
 #[cfg(feature = "unicache")]
 use crate::{unicache::*, util::NodeId};
@@ -34,6 +34,7 @@ where
     pub unicache: T::UniCache,
 }
 
+#[allow(dead_code)]
 impl<T> StateCache<T>
 where
     T: Entry,

@@ -1,0 +1,3681 @@
+use std::cmp::Ordering;
+
+/// Ballot Leader Election algorithm for electing new leaders
+use crate::{
+    sequence_paxos::{Phase, Role},
+    util::{ConfigurationId, FlexibleQuorum, Quorum, defaults::*},
+};
+
+#[cfg(feature = "logging")]
+use crate::utils::logger::create_logger;
+use crate::{
+    OmniPaxosConfig,
+    messages::ballot_leader_election::{
+        BLEMessage, HeartbeatMsg, HeartbeatReply, HeartbeatRequest,
+    },
+    util::NodeId,
+};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "logging")]
+use slog::{Logger, info, trace};
+
+/// Used to define a Sequence Paxos epoch
+#[derive(Clone, Copy, Eq, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Ballot {
+    /// The identifier for the configuration that the replica with this ballot is part of.
+    pub config_id: ConfigurationId,
+    /// Ballot number
+    pub n: u32,
+    /// Custom priority parameter
+    pub priority: u32,
+    /// The pid of the process
+    pub pid: NodeId,
+}
+
+impl Ballot {
+    /// Creates a new Ballot
+    /// # Arguments
+    /// * `config_id` - The identifier for the configuration that the replica with this ballot is part of.
+    /// * `n` - Ballot number.
+    /// * `pid` -  Used as tiebreaker for total ordering of ballots.
+    pub fn with(config_id: ConfigurationId, n: u32, priority: u32, pid: NodeId) -> Ballot {
+        Ballot {
+            config_id,
+            n,
+            priority,
+            pid,
+        }
+    }
+}
+
+impl Ord for Ballot {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.n, self.priority, self.pid).cmp(&(other.n, other.priority, other.pid))
+    }
+}
+
+impl PartialOrd for Ballot {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+const INITIAL_ROUND: u32 = 1;
+const RECOVERY_ROUND: u32 = 0;
+
+/// A Ballot Leader Election component. Used in conjunction with OmniPaxos to handle the election of a leader for a cluster of OmniPaxos servers,
+/// incoming messages and produces outgoing messages that the user has to fetch periodically and send using a network implementation.
+/// User also has to periodically fetch the decided entries that are guaranteed to be strongly consistent and linearizable, and therefore also safe to be used in the higher level application.
+pub(crate) struct BallotLeaderElection {
+    /// The identifier for the configuration that this instance is part of.
+    configuration_id: ConfigurationId,
+    /// Process identifier used to uniquely identify this instance.
+    pid: NodeId,
+    /// Vector that holds the pids of all the other servers.
+    peers: Vec<NodeId>,
+    /// The current round of the heartbeat cycle.
+    hb_round: u32,
+    /// The heartbeat replies this instance received during the current round.
+    heartbeat_replies: Vec<HeartbeatReply>,
+    /// Vector that holds all the received heartbeats from the previous heartbeat round, including the current node. Only used to display the connectivity of this node in the UI.
+    /// Represents nodes that are currently alive from the view of the current node.
+    prev_replies: Vec<HeartbeatReply>,
+    /// Holds the current ballot of this instance.
+    current_ballot: Ballot,
+    /// The current leader of this instance.
+    leader: Ballot,
+    /// A happy node either sees that it is, is connected to, or sees evidence of a potential leader
+    /// for the cluster. If a node is unhappy then it is seeking a new leader.
+    happy: bool,
+    /// The number of replicas inside the cluster whose heartbeats are needed to become and remain the leader.
+    quorum: Quorum,
+    /// Vector which holds all the outgoing messages of the BLE instance.
+    outgoing: Vec<BLEMessage>,
+    /// Logger used to output the status of the component.
+    #[cfg(feature = "logging")]
+    logger: Logger,
+}
+
+impl BallotLeaderElection {
+    /// Construct a new BallotLeaderElection node
+    pub(crate) fn with(config: BLEConfig, recovered_leader: Option<Ballot>) -> Self {
+        let config_id = config.configuration_id;
+        let pid = config.pid;
+        let peers = config.peers;
+        let num_nodes = &peers.len() + 1;
+        let quorum = Quorum::with(config.flexible_quorum, num_nodes);
+        let mut initial_ballot = Ballot::with(config_id, INITIAL_ROUND, config.priority, pid);
+        let initial_leader = match recovered_leader {
+            Some(b) if b != Ballot::default() => {
+                // Prevents a recovered server from retaining BLE leadership with the same ballot.
+                initial_ballot.n = RECOVERY_ROUND;
+                b
+            }
+            _ => initial_ballot,
+        };
+        let mut ble = BallotLeaderElection {
+            configuration_id: config_id,
+            pid,
+            peers,
+            hb_round: 0,
+            heartbeat_replies: Vec::with_capacity(num_nodes),
+            prev_replies: Vec::with_capacity(num_nodes),
+            current_ballot: initial_ballot,
+            leader: initial_leader,
+            happy: true,
+            quorum,
+            outgoing: Vec::with_capacity(config.buffer_size),
+            #[cfg(feature = "logging")]
+            logger: {
+                if let Some(logger) = config.custom_logger {
+                    logger
+                } else {
+                    let s = config
+                        .logger_file_path
+                        .unwrap_or_else(|| format!("logs/paxos_{}.log", pid));
+                    create_logger(s.as_str())
+                }
+            },
+        };
+        #[cfg(feature = "logging")]
+        {
+            info!(
+                ble.logger,
+                "Ballot Leader Election component pid: {} created!", pid
+            );
+        }
+        ble.new_hb_round();
+        ble
+    }
+
+    /// Update the custom priority used in the Ballot for this server. Note that changing the
+    /// priority triggers a leader re-election.
+    pub(crate) fn set_priority(&mut self, p: u32) {
+        self.current_ballot.priority = p;
+    }
+
+    /// Returns reference to outgoing messages
+    pub(crate) fn outgoing_mut(&mut self) -> &mut Vec<BLEMessage> {
+        &mut self.outgoing
+    }
+
+    /// Handle an incoming message.
+    /// # Arguments
+    /// * `m` - the message to be handled.
+    pub(crate) fn handle(&mut self, m: BLEMessage) {
+        match m.msg {
+            HeartbeatMsg::Request(req) => self.handle_request(m.from, req),
+            HeartbeatMsg::Reply(rep) => self.handle_reply(rep),
+        }
+    }
+
+    /// Initiates a new heartbeat round.
+    pub(crate) fn new_hb_round(&mut self) {
+        self.prev_replies = std::mem::take(&mut self.heartbeat_replies);
+        self.hb_round += 1;
+        #[cfg(feature = "logging")]
+        trace!(
+            self.logger,
+            "Initiate new heartbeat round: {}", self.hb_round
+        );
+        for peer in &self.peers {
+            let hb_request = HeartbeatRequest {
+                round: self.hb_round,
+            };
+            self.outgoing.push(BLEMessage {
+                from: self.pid,
+                to: *peer,
+                msg: HeartbeatMsg::Request(hb_request),
+            });
+        }
+    }
+
+    /// End of a heartbeat round. Returns current leader and election status.
+    pub(crate) fn hb_timeout(
+        &mut self,
+        seq_paxos_state: &(Role, Phase),
+        seq_paxos_promise: Ballot,
+    ) -> Option<Ballot> {
+        self.update_leader();
+        self.update_happiness(seq_paxos_state);
+        self.check_takeover();
+        self.new_hb_round();
+        if seq_paxos_promise > self.leader {
+            // Sync leader with Paxos promise in case ballot didn't make it to BLE followers
+            // or become_leader() was called.
+            self.leader = seq_paxos_promise;
+            if seq_paxos_promise.pid == self.pid {
+                self.current_ballot = seq_paxos_promise;
+            }
+            self.happy = true;
+        }
+        if self.leader == self.current_ballot {
+            Some(self.current_ballot)
+        } else {
+            None
+        }
+    }
+
+    fn update_leader(&mut self) {
+        let max_reply_ballot = self.heartbeat_replies.iter().map(|r| r.ballot).max();
+        if let Some(max) = max_reply_ballot {
+            if max > self.leader {
+                self.leader = max;
+            }
+        }
+    }
+
+    fn update_happiness(&mut self, seq_paxos_state: &(Role, Phase)) {
+        self.happy = if self.leader == self.current_ballot {
+            let potential_followers = self
+                .heartbeat_replies
+                .iter()
+                .filter(|hb_reply| hb_reply.leader <= self.current_ballot)
+                .count();
+            let can_form_quorum = match seq_paxos_state {
+                (Role::Leader, Phase::Accept) => {
+                    self.quorum.is_accept_quorum(potential_followers + 1)
+                }
+                _ => self.quorum.is_prepare_quorum(potential_followers + 1),
+            };
+            if can_form_quorum {
+                true
+            } else {
+                let see_larger_happy_leader = self
+                    .heartbeat_replies
+                    .iter()
+                    .any(|r| r.leader > self.current_ballot && r.happy);
+                see_larger_happy_leader
+            }
+        } else {
+            self.heartbeat_replies
+                .iter()
+                .any(|r| r.ballot == self.leader && r.happy)
+        };
+    }
+
+    fn check_takeover(&mut self) {
+        if !self.happy {
+            let all_neighbors_unhappy = self.heartbeat_replies.iter().all(|r| !r.happy);
+            let im_quorum_connected = self
+                .quorum
+                .is_prepare_quorum(self.heartbeat_replies.len() + 1);
+            if all_neighbors_unhappy && im_quorum_connected {
+                // We increment past our leader instead of max of unhappy ballots because we
+                // assume we have already checked leader for this round so they should be equal
+                self.current_ballot.n = self.leader.n + 1;
+                self.leader = self.current_ballot;
+                self.happy = true;
+            }
+        }
+    }
+
+    fn handle_request(&mut self, from: NodeId, req: HeartbeatRequest) {
+        let hb_reply = HeartbeatReply {
+            round: req.round,
+            ballot: self.current_ballot,
+            leader: self.leader,
+            happy: self.happy,
+        };
+        self.outgoing.push(BLEMessage {
+            from: self.pid,
+            to: from,
+            msg: HeartbeatMsg::Reply(hb_reply),
+        });
+    }
+
+    fn handle_reply(&mut self, rep: HeartbeatReply) {
+        if rep.round == self.hb_round && rep.ballot.config_id == self.configuration_id {
+            self.heartbeat_replies.push(rep);
+        }
+    }
+
+    pub(crate) fn get_current_ballot(&self) -> Ballot {
+        self.current_ballot
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get_ballots(&self) -> Vec<HeartbeatReply> {
+        self.prev_replies.clone()
+    }
+}
+
+/// Configuration for `BallotLeaderElection`.
+/// # Fields
+/// * `configuration_id`: The identifier for the configuration that this node is part of.
+/// * `pid`: The unique identifier of this node. Must not be 0.
+/// * `peers`: The peers of this node i.e. the `pid`s of the other servers in the configuration.
+/// * `priority`: Set custom priority for this node to be elected as the leader.
+/// * `flexible_quorum` : Defines read and write quorum sizes. Can be used for different latency vs fault tolerance tradeoffs.
+/// * `buffer_size`: The buffer size for outgoing messages.
+/// * `logger_file_path`: The path where the default logger logs events.
+#[derive(Clone, Debug)]
+pub(crate) struct BLEConfig {
+    configuration_id: ConfigurationId,
+    pid: NodeId,
+    peers: Vec<NodeId>,
+    priority: u32,
+    flexible_quorum: Option<FlexibleQuorum>,
+    buffer_size: usize,
+    #[cfg(feature = "logging")]
+    logger_file_path: Option<String>,
+    #[cfg(feature = "logging")]
+    custom_logger: Option<Logger>,
+}
+
+impl From<OmniPaxosConfig> for BLEConfig {
+    fn from(config: OmniPaxosConfig) -> Self {
+        let pid = config.server_config.pid;
+        let peers = config
+            .cluster_config
+            .nodes
+            .into_iter()
+            .filter(|x| *x != pid)
+            .collect();
+
+        Self {
+            configuration_id: config.cluster_config.configuration_id,
+            pid,
+            peers,
+            priority: config.server_config.leader_priority,
+            flexible_quorum: config.cluster_config.flexible_quorum,
+            buffer_size: BLE_BUFFER_SIZE,
+            #[cfg(feature = "logging")]
+            logger_file_path: config.server_config.logger_file_path,
+            #[cfg(feature = "logging")]
+            custom_logger: config.server_config.custom_logger,
+        }
+    }
+}
+/// Holds helpful functions used in creating loggers.
+#[cfg(feature = "logging")]
+pub mod logger;
+/// Holds helpful functions used in OmniPaxosUI.
+pub mod ui;
+use slog::{o, Drain, Logger};
+use std::{fs::OpenOptions, sync::Mutex};
+
+/// Creates an asynchronous logger which outputs to both the terminal and a specified file_path.
+pub fn create_logger(file_path: &str) -> Logger {
+    let path = std::path::Path::new(file_path);
+    let prefix = path.parent().unwrap(); // todo change unwrap
+    std::fs::create_dir_all(prefix).unwrap(); // todo change unwrap
+
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(file_path)
+        .unwrap(); // todo change unwrap
+
+    let term_decorator = slog_term::TermDecorator::new().build();
+    let file_decorator = slog_term::PlainSyncDecorator::new(file);
+
+    let term_fuse = slog_term::FullFormat::new(term_decorator).build().fuse();
+    let file_fuse = slog_term::FullFormat::new(file_decorator).build().fuse();
+
+    let both = Mutex::new(slog::Duplicate::new(term_fuse, file_fuse)).fuse();
+    let both = slog_async::Async::new(both).build().fuse();
+    Logger::root(both, o!())
+}
+use crate::{
+    ballot_leader_election::Ballot,
+    messages::ballot_leader_election::HeartbeatReply,
+    util::{LeaderState, NodeId},
+};
+
+/// The states of all the nodes in the cluster.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterState {
+    /// The accepted indexes of all the nodes in the cluster. The index of the vector is the node id.
+    pub accepted_indexes: Vec<usize>,
+    /// All the received heartbeats from the previous heartbeat round, including the current node.
+    /// Represents nodes that are currently alive from the view of the current node.
+    pub heartbeats: Vec<HeartbeatReply>,
+}
+
+impl From<&LeaderState> for ClusterState {
+    fn from(_leader_state: &LeaderState) -> Self {
+        unreachable!()
+    }
+}
+
+/// The states that are for UI to show.
+pub struct OmniPaxosStates {
+    /// The current ballot
+    pub current_ballot: Ballot,
+    /// The current leader
+    pub current_leader: Option<NodeId>,
+    /// The current decided index
+    pub decided_idx: usize,
+    /// All the received heartbeats from the previous heartbeat round, including the current node.
+    /// Represents nodes that are currently alive from the view of the current node.
+    pub heartbeats: Vec<HeartbeatReply>,
+    /// The states of all the nodes in the cluster.
+    pub cluster_state: ClusterState,
+}
+use crate::{
+    messages::{ballot_leader_election::BLEMessage, sequence_paxos::PaxosMessage},
+    storage::Entry,
+    util::NodeId,
+};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+/// Internal component for log replication
+pub mod sequence_paxos {
+    use crate::{
+        ballot_leader_election::Ballot,
+        storage::Entry,
+        util::{LogSync, NodeId},
+    };
+    #[cfg(feature = "serde")]
+    use serde::{Deserialize, Serialize};
+    use std::fmt::Debug;
+
+    /// Message sent by a follower on crash-recovery or dropped messages to request its leader to re-prepare them.
+    #[derive(Copy, Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct PrepareReq {
+        /// The current round.
+        pub n: Ballot,
+    }
+
+    /// Promise message sent by a follower in response to a [`Prepare`] sent by the leader.
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct Promise<T>
+    where
+        T: Entry,
+    {
+        /// The current round.
+        pub n: Ballot,
+        /// The latest round in which an entry was accepted.
+        pub n_accepted: Ballot,
+        /// The decided index of this follower.
+        pub decided_idx: usize,
+        /// The log length of this follower.
+        pub accepted_idx: usize,
+        /// The log update which the leader applies to its log in order to sync
+        /// with this follower (if the follower is more up-to-date).
+        pub log_sync: Option<LogSync<T>>,
+    }
+
+    /// An enum for all the different message types.
+    #[allow(missing_docs)]
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub enum PaxosMsg<T>
+    where
+        T: Entry,
+    {
+        /// Request a [`Prepare`] to be sent from the leader. Used for fail-recovery.
+        PrepareReq(PrepareReq),
+        #[allow(missing_docs)]
+        Promise(Promise<T>),
+        /// Forward client proposals to the leader.
+        ProposalForward(Vec<T>),
+    }
+
+    /// A struct for a Paxos message that also includes sender and receiver.
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct PaxosMessage<T>
+    where
+        T: Entry,
+    {
+        /// Sender of `msg`.
+        pub from: NodeId,
+        /// Receiver of `msg`.
+        pub to: NodeId,
+        /// The message content.
+        pub msg: PaxosMsg<T>,
+    }
+}
+
+/// The different messages BLE uses to communicate with other servers.
+pub mod ballot_leader_election {
+
+    use crate::{ballot_leader_election::Ballot, util::NodeId};
+    #[cfg(feature = "serde")]
+    use serde::{Deserialize, Serialize};
+
+    /// An enum for all the different BLE message types.
+    #[allow(missing_docs)]
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub enum HeartbeatMsg {
+        Request(HeartbeatRequest),
+        Reply(HeartbeatReply),
+    }
+
+    /// Requests a reply from all the other servers.
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct HeartbeatRequest {
+        /// Number of the current round.
+        pub round: u32,
+    }
+
+    /// Replies
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct HeartbeatReply {
+        /// Number of the current heartbeat round.
+        pub round: u32,
+        /// Ballot of replying server.
+        pub ballot: Ballot,
+        /// Leader this server is following
+        pub leader: Ballot,
+        /// Whether the replying server sees a need for a new leader
+        pub happy: bool,
+    }
+
+    /// A struct for a Paxos message that also includes sender and receiver.
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct BLEMessage {
+        /// Sender of `msg`.
+        pub from: NodeId,
+        /// Receiver of `msg`.
+        pub to: NodeId,
+        /// The message content.
+        pub msg: HeartbeatMsg,
+    }
+}
+
+#[allow(missing_docs)]
+/// Message in OmniPaxos. Can be either a `SequencePaxos` message (for log replication) or `BLE` message (for leader election)
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Message<T>
+where
+    T: Entry,
+{
+    SequencePaxos(PaxosMessage<T>),
+    BLE(BLEMessage),
+}
+
+impl<T> Message<T>
+where
+    T: Entry,
+{
+    /// Get the sender id of the message
+    pub fn get_sender(&self) -> NodeId {
+        match self {
+            Message::SequencePaxos(p) => p.from,
+            Message::BLE(b) => b.from,
+        }
+    }
+
+    /// Get the receiver id of the message
+    pub fn get_receiver(&self) -> NodeId {
+        match self {
+            Message::SequencePaxos(p) => p.to,
+            Message::BLE(b) => b.to,
+        }
+    }
+}
+use super::{
+    ballot_leader_election::Ballot,
+    storage::{Entry, SnapshotType, StopSign},
+};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
+
+/// Struct used to help another server synchronize their log with the current state of our own log.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct LogSync<T>
+where
+    T: Entry,
+{
+    /// The decided snapshot.
+    pub decided_snapshot: Option<SnapshotType<T>>,
+    /// The log suffix.
+    pub suffix: Vec<T>,
+    /// The index of the log where the entries from `suffix` should be applied at (also the compacted idx of `decided_snapshot` if it exists).
+    pub sync_idx: usize,
+    /// The accepted StopSign.
+    pub stopsign: Option<StopSign>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LeaderState {
+    pub n_leader: Ballot,
+    pub max_pid: usize,
+    pub quorum: Quorum,
+}
+
+impl LeaderState {
+    pub fn with(n_leader: Ballot, max_pid: usize, quorum: Quorum) -> Self {
+        Self {
+            n_leader,
+            max_pid,
+            quorum,
+        }
+    }
+}
+
+/// The entry read in the log.
+#[derive(Debug, Clone)]
+pub enum LogEntry<T>
+where
+    T: Entry,
+{
+    /// The entry is decided.
+    Decided(T),
+    /// The entry is NOT decided. Might be removed from the log at a later time.
+    Undecided(T),
+    /// The entry has been trimmed.
+    Trimmed(TrimmedIndex),
+    /// This Sequence Paxos instance has been stopped for reconfiguration. The accompanying bool
+    /// indicates whether the reconfiguration has been decided or not. If it is `true`, then the OmniPaxos instance for the new configuration can be started.
+    StopSign(StopSign, bool),
+}
+
+impl<T: PartialEq + Entry> PartialEq for LogEntry<T>
+where
+    <T as Entry>::Snapshot: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LogEntry::Decided(v1), LogEntry::Decided(v2)) => v1 == v2,
+            (LogEntry::Undecided(v1), LogEntry::Undecided(v2)) => v1 == v2,
+            (LogEntry::Trimmed(idx1), LogEntry::Trimmed(idx2)) => idx1 == idx2,
+            (LogEntry::StopSign(ss1, b1), LogEntry::StopSign(ss2, b2)) => ss1 == ss2 && b1 == b2,
+            _ => false,
+        }
+    }
+}
+
+/// Convenience struct for checking if a certain index exists, is compacted or is a StopSign.
+#[derive(Debug, Clone)]
+pub(crate) enum IndexEntry {
+    Entry,
+    Compacted,
+    StopSign(StopSign),
+}
+
+pub(crate) mod defaults {
+    pub(crate) const BUFFER_SIZE: usize = 100000;
+    pub(crate) const BLE_BUFFER_SIZE: usize = 100;
+    pub(crate) const ELECTION_TIMEOUT: u64 = 1;
+    pub(crate) const RESEND_MESSAGE_TIMEOUT: u64 = 100;
+    pub(crate) const FLUSH_BATCH_TIMEOUT: u64 = 200;
+}
+
+#[allow(missing_docs)]
+pub type TrimmedIndex = usize;
+
+/// ID for an OmniPaxos node
+pub type NodeId = u64;
+/// ID for an OmniPaxos configuration (i.e., the set of servers in an OmniPaxos cluster)
+pub type ConfigurationId = u32;
+
+/// Error message to display when there was an error reading to the storage implementation.
+pub const READ_ERROR_MSG: &str = "Error reading from storage.";
+/// Error message to display when there was an error writing to the storage implementation.
+pub const WRITE_ERROR_MSG: &str = "Error writing to storage.";
+
+/// Used for checking the ordering of message sequences in the accept phase
+
+/// Keeps track of the ordering of messages in the accept phase
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SequenceNumber {
+    /// Meant to refer to a TCP session
+    pub session: u64,
+    /// The sequence number with respect to a session
+    pub counter: u64,
+}
+
+pub(crate) struct LogicalClock {
+    time: u64,
+    timeout: u64,
+}
+
+impl LogicalClock {
+    pub fn with(timeout: u64) -> Self {
+        Self { time: 0, timeout }
+    }
+
+    pub fn tick_and_check_timeout(&mut self) -> bool {
+        self.time += 1;
+        if self.time == self.timeout {
+            self.time = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Flexible quorums can be used to increase/decrease the read and write quorum sizes,
+/// for different latency vs fault tolerance tradeoffs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "serde", feature = "toml_config"), derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct FlexibleQuorum {
+    /// The number of nodes a leader needs to consult to get an up-to-date view of the log.
+    pub read_quorum_size: usize,
+    /// The number of acknowledgments a leader needs to commit an entry to the log
+    pub write_quorum_size: usize,
+}
+
+/// The type of quorum used by the OmniPaxos cluster.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum Quorum {
+    /// Both the read quorum and the write quorums are a majority of nodes
+    Majority(usize),
+    /// The read and write quorum sizes are defined by a `FlexibleQuorum`
+    Flexible(FlexibleQuorum),
+}
+
+impl Quorum {
+    pub(crate) fn with(flexible_quorum_config: Option<FlexibleQuorum>, num_nodes: usize) -> Self {
+        match flexible_quorum_config {
+            Some(FlexibleQuorum {
+                read_quorum_size,
+                write_quorum_size,
+            }) => Quorum::Flexible(FlexibleQuorum {
+                read_quorum_size,
+                write_quorum_size,
+            }),
+            None => Quorum::Majority(num_nodes / 2 + 1),
+        }
+    }
+
+    pub(crate) fn is_prepare_quorum(&self, num_nodes: usize) -> bool {
+        match self {
+            Quorum::Majority(majority) => num_nodes >= *majority,
+            Quorum::Flexible(flex_quorum) => num_nodes >= flex_quorum.read_quorum_size,
+        }
+    }
+
+    pub(crate) fn is_accept_quorum(&self, num_nodes: usize) -> bool {
+        match self {
+            Quorum::Majority(majority) => num_nodes >= *majority,
+            Quorum::Flexible(flex_quorum) => num_nodes >= flex_quorum.write_quorum_size,
+        }
+    }
+}
+use log::warn;
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap},
+    ops::Deref,
+    sync::Arc,
+    time::SystemTime,
+};
+use tokio::sync::{Mutex, oneshot};
+
+use crate::clock::Clock;
+
+pub trait Request: Send {
+    fn get_deadline(&self) -> SystemTime;
+    fn get_id(&self) -> usize;
+}
+
+struct StoredRequest<R: Request>(R);
+
+impl<R: Request> Deref for StoredRequest<R> {
+    type Target = R;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<R: Request> Ord for StoredRequest<R> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.get_deadline().cmp(&self.get_deadline()) // reverse for min-heap
+    }
+}
+
+impl<R: Request> PartialOrd for StoredRequest<R> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<R: Request> PartialEq for StoredRequest<R> {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_deadline() == other.get_deadline()
+    }
+}
+
+impl<R: Request> Eq for StoredRequest<R> {}
+
+#[allow(dead_code)]
+pub struct Buffers<R: Request> {
+    clock: Clock,
+    early: BinaryHeap<StoredRequest<R>>,
+    notifiers: HashMap<usize, oneshot::Sender<R>>,
+    late: HashMap<usize, R>,
+}
+
+type BuffersRef<R> = Arc<Mutex<Buffers<R>>>;
+
+#[allow(dead_code)]
+impl<R: Request + 'static> Buffers<R> {
+    fn new(clock: Clock) -> BuffersRef<R> {
+        let buffers = Arc::new(Mutex::new(Buffers {
+            clock,
+            early: BinaryHeap::new(),
+            late: HashMap::new(),
+            notifiers: HashMap::new(),
+        }));
+
+        let buffers_cloned = buffers.clone();
+        tokio::spawn(async move {
+            Self::waiter(buffers_cloned).await;
+        });
+
+        buffers
+    }
+
+    async fn waiter(buffers: BuffersRef<R>) {
+        loop {
+            let (sender, req, clock) = loop {
+                let mut locked = buffers.lock().await;
+                match locked.early.pop() {
+                    Some(req) => {
+                        break (
+                            locked.notifiers.remove(&req.get_id()),
+                            req,
+                            locked.clock.clone(),
+                        );
+                    }
+                    None => continue,
+                }
+            };
+            let deadline = req.get_deadline();
+            let notifier = clock.add_deadline(deadline).await;
+            if let Err(e) = notifier.await {
+                warn!("Failed to receiv notification for a deadline: {e}");
+                continue;
+            }
+            match sender {
+                Some(sender) => {
+                    if let Err(_) = sender.send(req.0) {
+                        warn!("Failed to send the request");
+                    }
+                }
+                None => {
+                    warn!("Notifiers and early buffer are not synchronized.");
+                }
+            }
+        }
+    }
+
+    async fn insert(buffers: BuffersRef<R>, r: R) -> oneshot::Receiver<R> {
+        let (tx, rx) = oneshot::channel();
+        let mut locked = buffers.lock().await;
+        let r = StoredRequest(r);
+        locked.notifiers.insert(r.get_id(), tx);
+        locked.early.push(r);
+        rx
+    }
+}
+//! OmniPaxos is a library for implementing distributed replicated logs with strong consistency guarantees
+//! that provides seamless reconfiguration while also being completely resilient to partial network partitions.
+//! This library provides the distributed log abstraction as a black-box for the user, where the user only has to
+//! provide its desired network and storage implementations.
+//!
+//! # Crate feature flags
+//! The following crate feature flags are available. They are configured in your Cargo.toml.
+//! * `batch_accept` - Batch multiple log entries into a single message to reduce overhead.
+//! * `logging` - System-wide logging with the slog crate
+//! * `toml_config` - Create an OmniPaxos instance from a TOML configuration file
+//! * `serde` - Serialization and deserialization of messages and internal structs with serde. Disable this if you want to implement your own custom ser/deserialization or want to store data that is not serde-supported.
+
+/// Trait and struct related to the leader election in Omni-Paxos.
+pub mod ballot_leader_election;
+pub mod buffers;
+pub mod clock;
+/// OmniPaxos error definitions
+pub mod errors;
+/// The different messages OmniPaxos servers can communicate to each other with.
+pub mod messages;
+/// The user-facing OmniPaxos struct.
+mod omni_paxos;
+pub use omni_paxos::*;
+
+/// The core replication algorithm of OmniPaxos.
+pub(crate) mod sequence_paxos;
+/// Traits and structs related to the backend storage of an OmniPaxos server.
+pub mod storage;
+
+#[cfg(feature = "unicache")]
+/// Traits, structs, and types related to the unicache.
+pub mod unicache;
+/// A module containing helper functions and structs.
+pub mod util;
+/// A module containing helper functions and structs.
+pub mod utils;
+
+#[cfg(feature = "macros")]
+#[allow(unused_imports)]
+#[macro_use]
+extern crate omnipaxos_macros;
+
+#[cfg(feature = "macros")]
+/// Macros in the omnipaxos crate
+pub mod macros {
+    #[doc(hidden)]
+    pub use omnipaxos_macros::*;
+}
+use super::{ballot_leader_election::Ballot, messages::sequence_paxos::*, util::LeaderState};
+#[cfg(feature = "logging")]
+use crate::utils::logger::create_logger;
+use crate::{
+    ClusterConfig, OmniPaxosConfig, ProposeErr,
+    messages::Message,
+    storage::{
+        Entry, Snapshot, StopSign, Storage,
+        internal_storage::{InternalStorage, InternalStorageConfig},
+    },
+    util::{FlexibleQuorum, LogSync, NodeId, Quorum, READ_ERROR_MSG, WRITE_ERROR_MSG},
+};
+#[cfg(feature = "logging")]
+use slog::{Logger, debug, info, warn};
+use std::{fmt::Debug, vec};
+
+pub mod follower;
+pub mod leader;
+
+/// a Sequence Paxos replica. Maintains local state of the replicated log, handles incoming messages and produces outgoing messages that the user has to fetch periodically and send using a network implementation.
+/// User also has to periodically fetch the decided entries that are guaranteed to be strongly consistent and linearizable, and therefore also safe to be used in the higher level application.
+/// If snapshots are not desired to be used, use `()` for the type parameter `S`.
+pub(crate) struct SequencePaxos<T, B>
+where
+    T: Entry,
+    B: Storage<T>,
+{
+    pub(crate) internal_storage: InternalStorage<B, T>,
+    pid: NodeId,
+    peers: Vec<NodeId>, // excluding self pid
+    state: (Role, Phase),
+    buffered_proposals: Vec<T>,
+    outgoing: Vec<Message<T>>,
+    leader_state: LeaderState,
+    latest_accepted_meta: Option<(Ballot, usize)>,
+    // Keeps track of sequence of accepts from leader where AcceptSync = 1
+    cached_promise_message: Option<Promise<T>>,
+    #[cfg(feature = "logging")]
+    logger: Logger,
+}
+
+impl<T, B> SequencePaxos<T, B>
+where
+    T: Entry,
+    B: Storage<T>,
+{
+    /*** User functions ***/
+    /// Creates a Sequence Paxos replica.
+    pub(crate) fn with(config: SequencePaxosConfig, storage: B) -> Self {
+        let pid = config.pid;
+        let peers = config.peers;
+        let num_nodes = &peers.len() + 1;
+        let quorum = Quorum::with(config.flexible_quorum, num_nodes);
+        let max_peer_pid = peers.iter().max().unwrap();
+        let max_pid = *std::cmp::max(max_peer_pid, &pid) as usize;
+        let outgoing = Vec::with_capacity(config.buffer_size);
+        let (state, leader) = match storage
+            .get_promise()
+            .expect("storage error while trying to read promise")
+        {
+            // if we recover a promise from storage then we must do failure recovery
+            Some(b) => {
+                // TODO: Nazha recovering
+                let state = (Role::Follower, Phase::Recover);
+                (state, b)
+            }
+            None => ((Role::Follower, Phase::None), Ballot::default()),
+        };
+        let internal_storage_config = InternalStorageConfig {
+            batch_size: config.batch_size,
+        };
+        let mut paxos = SequencePaxos {
+            internal_storage: InternalStorage::with(
+                storage,
+                internal_storage_config,
+                #[cfg(feature = "unicache")]
+                pid,
+            ),
+            pid,
+            peers,
+            state,
+            buffered_proposals: vec![],
+            outgoing,
+            leader_state: LeaderState::with(leader, max_pid, quorum),
+            latest_accepted_meta: None,
+            cached_promise_message: None,
+            #[cfg(feature = "logging")]
+            logger: {
+                if let Some(logger) = config.custom_logger {
+                    logger
+                } else {
+                    let s = config
+                        .logger_file_path
+                        .unwrap_or_else(|| format!("logs/paxos_{}.log", pid));
+                    create_logger(s.as_str())
+                }
+            },
+        };
+        paxos
+            .internal_storage
+            .set_promise(leader)
+            .expect(WRITE_ERROR_MSG);
+        #[cfg(feature = "logging")]
+        {
+            info!(paxos.logger, "Paxos component pid: {} created!", pid);
+            if let Quorum::Flexible(flex_quorum) = quorum {
+                if flex_quorum.read_quorum_size > num_nodes - flex_quorum.write_quorum_size + 1 {
+                    warn!(
+                        paxos.logger,
+                        "Unnecessary overlaps in read and write quorums. Read and Write quorums only need to be overlapping by one node i.e., read_quorum_size + write_quorum_size = num_nodes + 1"
+                    );
+                }
+            }
+        }
+        paxos
+    }
+
+    pub(crate) fn get_state(&self) -> &(Role, Phase) {
+        &self.state
+    }
+
+    pub(crate) fn get_promise(&self) -> Ballot {
+        self.internal_storage.get_promise()
+    }
+
+    /// Detects if a Prepare, Promise, AcceptStopSign, Decide of a Stopsign, or PrepareReq message
+    /// has been sent but not been received. If so resends them. Note: We can't detect if a
+    /// StopSign's Decide message has been received so we always resend to be safe.
+    pub(crate) fn resend_message_timeout(&mut self) {
+        match self.state.0 {
+            Role::Leader => self.resend_messages_leader(),
+            Role::Follower => self.resend_messages_follower(),
+        }
+    }
+
+    /// Flushes any batched log entries and sends their corresponding Accept or Accepted messages.
+    pub(crate) fn flush_batch_timeout(&mut self) {
+        match self.state {
+            _ => (),
+        }
+    }
+
+    /// Moves the outgoing messages from this replica into the buffer. The messages should then be sent via the network implementation.
+    /// If `buffer` is empty, it gets swapped with the internal message buffer. Otherwise, messages are appended to the buffer. This prevents messages from getting discarded.
+    /// the buffer.
+    pub(crate) fn take_outgoing_msgs(&mut self, buffer: &mut Vec<Message<T>>) {
+        if buffer.is_empty() {
+            std::mem::swap(buffer, &mut self.outgoing);
+        } else {
+            // User has unsent messages in their buffer, must extend their buffer.
+            buffer.append(&mut self.outgoing);
+        }
+        self.latest_accepted_meta = None;
+    }
+
+    /// Handle an incoming message.
+    pub(crate) fn handle(&mut self, m: PaxosMessage<T>) {
+        match m.msg {
+            PaxosMsg::ProposalForward(proposals) => self.handle_forwarded_proposal(proposals),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Returns whether this Sequence Paxos has been reconfigured
+    pub(crate) fn is_reconfigured(&self) -> Option<StopSign> {
+        match self.internal_storage.get_stopsign() {
+            Some(ss) if self.internal_storage.stopsign_is_decided() => Some(ss),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this Sequence Paxos instance is stopped, i.e. if it has been reconfigured.
+    fn accepted_reconfiguration(&self) -> bool {
+        self.internal_storage.get_stopsign().is_some()
+    }
+
+    /// Append an entry to the replicated log.
+    pub(crate) fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {
+        if self.accepted_reconfiguration() {
+            Err(ProposeErr::PendingReconfigEntry(entry))
+        } else {
+            self.propose_entry(entry);
+            Ok(())
+        }
+    }
+
+    /// Propose a reconfiguration. Returns an error if already stopped or `new_config` is invalid.
+    /// `new_config` defines the cluster-wide configuration settings for the next cluster.
+    /// `metadata` is optional data to commit alongside the reconfiguration.
+    pub(crate) fn reconfigure(
+        &mut self,
+        new_config: ClusterConfig,
+        metadata: Option<Vec<u8>>,
+    ) -> Result<(), ProposeErr<T>> {
+        if self.accepted_reconfiguration() {
+            return Err(ProposeErr::PendingReconfigConfig(new_config, metadata));
+        }
+        #[cfg(feature = "logging")]
+        info!(
+            self.logger,
+            "Accepting reconfiguration {:?}", new_config.nodes
+        );
+        match self.state {
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn get_current_leader(&self) -> NodeId {
+        self.get_promise().pid
+    }
+
+    /// Handles re-establishing a connection to a previously disconnected peer.
+    /// This should only be called if the underlying network implementation indicates that a connection has been re-established.
+    pub(crate) fn reconnected(&mut self, pid: NodeId) {
+        if pid == self.pid {
+            return;
+        } else if pid == self.get_current_leader() {
+            self.state = (Role::Follower, Phase::Recover);
+        }
+        let prepreq = PrepareReq {
+            n: self.get_promise(),
+        };
+        self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+            from: self.pid,
+            to: pid,
+            msg: PaxosMsg::PrepareReq(prepreq),
+        }));
+    }
+
+    fn propose_entry(&mut self, entry: T) {
+        match self.state {
+            _ => self.forward_proposals(vec![entry]),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get_leader_state(&self) -> &LeaderState {
+        &self.leader_state
+    }
+
+    pub(crate) fn forward_proposals(&mut self, mut entries: Vec<T>) {
+        let leader = self.get_current_leader();
+        if leader > 0 && self.pid != leader {
+            let pf = PaxosMsg::ProposalForward(entries);
+            let msg = Message::SequencePaxos(PaxosMessage {
+                from: self.pid,
+                to: leader,
+                msg: pf,
+            });
+            self.outgoing.push(msg);
+        } else {
+            self.buffered_proposals.append(&mut entries);
+        }
+    }
+
+    /// Returns `LogSync`, a struct to help other servers synchronize their log to correspond to the
+    /// current state of our own log. The `common_prefix_idx` marks where in the log the other server
+    /// needs to be sync from.
+    #[allow(dead_code)]
+    fn create_log_sync(
+        &self,
+        common_prefix_idx: usize,
+        other_logs_decided_idx: usize,
+    ) -> LogSync<T> {
+        let decided_idx = self.internal_storage.get_decided_idx();
+        let (decided_snapshot, suffix, sync_idx) =
+            if T::Snapshot::use_snapshots() && decided_idx > common_prefix_idx {
+                // Note: We snapshot from the other log's decided index and not the common prefix because
+                // snapshots currently only work on decided entries.
+                let (delta_snapshot, compacted_idx) = self
+                    .internal_storage
+                    .create_diff_snapshot(other_logs_decided_idx)
+                    .expect(READ_ERROR_MSG);
+                let suffix = self
+                    .internal_storage
+                    .get_suffix(decided_idx)
+                    .expect(READ_ERROR_MSG);
+                (delta_snapshot, suffix, compacted_idx)
+            } else {
+                let suffix = self
+                    .internal_storage
+                    .get_suffix(common_prefix_idx)
+                    .expect(READ_ERROR_MSG);
+                (None, suffix, common_prefix_idx)
+            };
+        LogSync {
+            decided_snapshot,
+            suffix,
+            sync_idx,
+            stopsign: self.internal_storage.get_stopsign(),
+        }
+    }
+}
+
+#[derive(PartialEq, Debug)]
+pub(crate) enum Phase {
+    Prepare,
+    Accept,
+    Recover,
+    None,
+}
+
+#[derive(PartialEq, Debug)]
+pub(crate) enum Role {
+    Follower,
+    Leader,
+}
+
+/// Configuration for `SequencePaxos`.
+/// # Fields
+/// * `pid`: The unique identifier of this node. Must not be 0.
+/// * `peers`: The peers of this node i.e. the `pid`s of the other servers in the configuration.
+/// * `flexible_quorum` : Defines read and write quorum sizes. Can be used for different latency vs fault tolerance tradeoffs.
+/// * `buffer_size`: The buffer size for outgoing messages.
+/// * `batch_size`: The size of the buffer for log batching. The default is 1, which means no batching.
+/// * `logger_file_path`: The path where the default logger logs events.
+#[derive(Clone, Debug)]
+pub(crate) struct SequencePaxosConfig {
+    pid: NodeId,
+    peers: Vec<NodeId>,
+    buffer_size: usize,
+    pub(crate) batch_size: usize,
+    flexible_quorum: Option<FlexibleQuorum>,
+    #[cfg(feature = "logging")]
+    logger_file_path: Option<String>,
+    #[cfg(feature = "logging")]
+    custom_logger: Option<Logger>,
+}
+
+impl From<OmniPaxosConfig> for SequencePaxosConfig {
+    fn from(config: OmniPaxosConfig) -> Self {
+        let pid = config.server_config.pid;
+        let peers = config
+            .cluster_config
+            .nodes
+            .into_iter()
+            .filter(|x| *x != pid)
+            .collect();
+        SequencePaxosConfig {
+            pid,
+            peers,
+            flexible_quorum: config.cluster_config.flexible_quorum,
+            buffer_size: config.server_config.buffer_size,
+            batch_size: config.server_config.batch_size,
+            #[cfg(feature = "logging")]
+            logger_file_path: config.server_config.logger_file_path,
+            #[cfg(feature = "logging")]
+            custom_logger: config.server_config.custom_logger,
+        }
+    }
+}
+use super::*;
+
+impl<T, B> SequencePaxos<T, B>
+where
+    T: Entry,
+    B: Storage<T>,
+{
+    pub(crate) fn resend_messages_follower(&mut self) {
+        match self.state.1 {
+            Phase::Prepare => {
+                // Resend Promise
+                match &self.cached_promise_message {
+                    Some(promise) => {
+                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                            from: self.pid,
+                            to: promise.n.pid,
+                            msg: PaxosMsg::Promise(promise.clone()),
+                        }));
+                    }
+                    None => {
+                        // Shouldn't be possible to be in prepare phase without having
+                        // cached the promise sent as a response to the prepare
+                        #[cfg(feature = "logging")]
+                        warn!(self.logger, "In Prepare phase without a cached promise!");
+                        self.state = (Role::Follower, Phase::Recover);
+                        self.send_preparereq_to_all_peers();
+                    }
+                }
+            }
+            Phase::Recover => {
+                // Resend PrepareReq
+                self.send_preparereq_to_all_peers();
+            }
+            Phase::Accept => (),
+            Phase::None => (),
+        }
+    }
+
+    fn send_preparereq_to_all_peers(&mut self) {
+        let prepreq = PrepareReq {
+            n: self.get_promise(),
+        };
+        for peer in &self.peers {
+            self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                from: self.pid,
+                to: *peer,
+                msg: PaxosMsg::PrepareReq(prepreq),
+            }));
+        }
+    }
+}
+use super::super::{ballot_leader_election::Ballot, util::LeaderState};
+use crate::util::WRITE_ERROR_MSG;
+
+use super::*;
+
+impl<T, B> SequencePaxos<T, B>
+where
+    T: Entry,
+    B: Storage<T>,
+{
+    /// Handle a new leader. Should be called when the leader election has elected a new leader with the ballot `n`
+    /*** Leader ***/
+    pub(crate) fn handle_leader(&mut self, n: Ballot) {
+        if n <= self.leader_state.n_leader || n <= self.internal_storage.get_promise() {
+            return;
+        }
+        #[cfg(feature = "logging")]
+        debug!(self.logger, "Newly elected leader: {:?}", n);
+        if self.pid == n.pid {
+            self.leader_state =
+                LeaderState::with(n, self.leader_state.max_pid, self.leader_state.quorum);
+            // Flush any pending writes
+            // Don't have to handle flushed entries here because we will sync with followers
+            let _ = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);
+            self.internal_storage.set_promise(n).expect(WRITE_ERROR_MSG);
+            /* insert my promise */
+
+            /* initialise longest chosen sequence and update state */
+            self.state = (Role::Leader, Phase::Prepare);
+        } else {
+            self.become_follower();
+        }
+    }
+
+    pub(crate) fn become_follower(&mut self) {
+        self.state.0 = Role::Follower;
+    }
+
+    pub(crate) fn resend_messages_leader(&mut self) {
+        match self.state.1 {
+            Phase::Prepare => {}
+            Phase::Accept => {}
+            Phase::Recover => (),
+            Phase::None => (),
+        }
+    }
+
+    pub(crate) fn handle_forwarded_proposal(&mut self, mut entries: Vec<T>) {
+        if !self.accepted_reconfiguration() {
+            match self.state {
+                (Role::Leader, Phase::Prepare) => self.buffered_proposals.append(&mut entries),
+                (Role::Leader, Phase::Accept) => {}
+                _ => self.forward_proposals(entries),
+            }
+        }
+    }
+}
+#[cfg(feature = "toml_config")]
+use std::io;
+use std::{error, fmt};
+#[cfg(feature = "toml_config")]
+use toml;
+
+/// Error type for the reading and parsing of OmniPaxosConfig TOML files
+#[derive(Debug)]
+pub enum ConfigError {
+    #[cfg(feature = "toml_config")]
+    /// Could not read TOML file
+    ReadFile(io::Error),
+    #[cfg(feature = "toml_config")]
+    /// Could not parse TOML file
+    Parse(toml::de::Error),
+    /// Invalid config fields
+    InvalidConfig(String),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            #[cfg(feature = "toml_config")]
+            ConfigError::ReadFile(ref err) => write!(f, "{}", err),
+            #[cfg(feature = "toml_config")]
+            ConfigError::Parse(ref err) => write!(f, "{}", err),
+            ConfigError::InvalidConfig(ref str) => write!(f, "Invalid config: {}", str),
+        }
+    }
+}
+
+impl error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match *self {
+            #[cfg(feature = "toml_config")]
+            ConfigError::ReadFile(ref err) => Some(err),
+            #[cfg(feature = "toml_config")]
+            ConfigError::Parse(ref err) => Some(err),
+            ConfigError::InvalidConfig(_) => Some(self),
+        }
+    }
+}
+
+#[cfg(feature = "toml_config")]
+impl From<io::Error> for ConfigError {
+    fn from(err: io::Error) -> ConfigError {
+        ConfigError::ReadFile(err)
+    }
+}
+
+#[cfg(feature = "toml_config")]
+impl From<toml::de::Error> for ConfigError {
+    fn from(err: toml::de::Error) -> ConfigError {
+        ConfigError::Parse(err)
+    }
+}
+
+#[allow(missing_docs)]
+macro_rules! valid_config {
+    ($pred:expr,$err_str:expr) => {
+        if !$pred {
+            return Err(ConfigError::InvalidConfig($err_str.to_owned()));
+        }
+    };
+}
+pub(crate) use valid_config;
+use crate::{
+    ballot_leader_election::{Ballot, BallotLeaderElection},
+    errors::{ConfigError, valid_config},
+    messages::Message,
+    sequence_paxos::{Phase, SequencePaxos},
+    storage::{Entry, StopSign, Storage},
+    util::{
+        ConfigurationId, FlexibleQuorum, LogEntry, LogicalClock, NodeId,
+        defaults::{BUFFER_SIZE, ELECTION_TIMEOUT, FLUSH_BATCH_TIMEOUT, RESEND_MESSAGE_TIMEOUT},
+    },
+};
+#[cfg(any(feature = "toml_config", feature = "serde"))]
+use serde::Deserialize;
+#[cfg(feature = "serde")]
+use serde::Serialize;
+#[cfg(feature = "toml_config")]
+use std::fs;
+use std::{
+    error::Error,
+    fmt::{Debug, Display},
+    ops::RangeBounds,
+};
+#[cfg(feature = "toml_config")]
+use toml;
+
+/// Configuration for `OmniPaxos`.
+/// # Fields
+/// * `cluster_config`: The configuration settings that are cluster-wide.
+/// * `server_config`: The configuration settings that are specific to this OmniPaxos server.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "toml_config", derive(Deserialize), serde(default))]
+pub struct OmniPaxosConfig {
+    pub cluster_config: ClusterConfig,
+    pub server_config: ServerConfig,
+}
+
+impl OmniPaxosConfig {
+    /// Checks that all the fields of the cluster config are valid.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.cluster_config.validate()?;
+        self.server_config.validate()?;
+        valid_config!(
+            self.cluster_config.nodes.contains(&self.server_config.pid),
+            "Nodes must include own server pid"
+        );
+        Ok(())
+    }
+
+    /// Creates a new `OmniPaxosConfig` from a `toml` file.
+    #[cfg(feature = "toml_config")]
+    pub fn with_toml(file_path: &str) -> Result<Self, ConfigError> {
+        let config_file = fs::read_to_string(file_path)?;
+        let config: OmniPaxosConfig = toml::from_str(&config_file)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Checks all configuration fields and returns the local OmniPaxos node if successful.
+    pub fn build<T, B>(self, storage: B) -> Result<OmniPaxos<T, B>, ConfigError>
+    where
+        T: Entry,
+        B: Storage<T>,
+    {
+        self.validate()?;
+        // Use stored ballot as initial BLE leader
+        let recovered_leader = storage
+            .get_promise()
+            .expect("storage error while trying to read promise");
+        Ok(OmniPaxos {
+            ble: BallotLeaderElection::with(self.clone().into(), recovered_leader),
+            election_clock: LogicalClock::with(self.server_config.election_tick_timeout),
+            resend_message_clock: LogicalClock::with(
+                self.server_config.resend_message_tick_timeout,
+            ),
+            flush_batch_clock: LogicalClock::with(self.server_config.flush_batch_tick_timeout),
+            seq_paxos: SequencePaxos::with(self.into(), storage),
+        })
+    }
+}
+
+/// Configuration for an `OmniPaxos` cluster.
+/// # Fields
+/// * `configuration_id`: The identifier for the cluster configuration that this OmniPaxos server is part of.
+/// * `nodes`: The nodes in the cluster i.e. the `pid`s of the other servers in the configuration.
+/// * `flexible_quorum` : Defines read and write quorum sizes. Can be used for different latency vs fault tolerance tradeoffs.
+#[derive(Clone, Debug, PartialEq, Default)]
+#[cfg_attr(any(feature = "serde", feature = "toml_config"), derive(Deserialize))]
+#[cfg_attr(feature = "toml_config", serde(default))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct ClusterConfig {
+    /// The identifier for the cluster configuration that this OmniPaxos server is part of. Must
+    /// not be 0 and be greater than the previous configuration's id.
+    pub configuration_id: ConfigurationId,
+    /// The nodes in the cluster i.e. the `pid`s of the servers in the configuration.
+    pub nodes: Vec<NodeId>,
+    /// Defines read and write quorum sizes. Can be used for different latency vs fault tolerance tradeoffs.
+    pub flexible_quorum: Option<FlexibleQuorum>,
+}
+
+impl ClusterConfig {
+    /// Checks that all the fields of the cluster config are valid.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let num_nodes = self.nodes.len();
+        valid_config!(num_nodes > 1, "Need more than 1 node");
+        valid_config!(self.configuration_id != 0, "Configuration ID cannot be 0");
+        if let Some(FlexibleQuorum {
+            read_quorum_size,
+            write_quorum_size,
+        }) = self.flexible_quorum
+        {
+            valid_config!(
+                read_quorum_size + write_quorum_size > num_nodes,
+                "The quorums must overlap i.e., the sum of their sizes must exceed the # of nodes"
+            );
+            valid_config!(
+                read_quorum_size >= 2 && read_quorum_size <= num_nodes,
+                "Read quorum must be in range 2 to # of nodes in the cluster"
+            );
+            valid_config!(
+                write_quorum_size >= 2 && write_quorum_size <= num_nodes,
+                "Write quorum must be in range 2 to # of nodes in the cluster"
+            );
+            valid_config!(
+                read_quorum_size >= write_quorum_size,
+                "Read quorum size must be >= the write quorum size."
+            );
+        }
+        Ok(())
+    }
+
+    /// Checks all configuration fields and builds a local OmniPaxos node with settings for this
+    /// node defined in `server_config` and using storage `with_storage`.
+    pub fn build_for_server<T, B>(
+        self,
+        server_config: ServerConfig,
+        with_storage: B,
+    ) -> Result<OmniPaxos<T, B>, ConfigError>
+    where
+        T: Entry,
+        B: Storage<T>,
+    {
+        let op_config = OmniPaxosConfig {
+            cluster_config: self,
+            server_config,
+        };
+        op_config.build(with_storage)
+    }
+}
+
+/// Configuration for a singular `OmniPaxos` instance in a cluster.
+/// # Fields
+/// * `pid`: The unique identifier of this node. Must not be 0.
+/// * `election_tick_timeout`: The number of calls to `tick()` before leader election is updated. If this is set to 5 and `tick()` is called every 10ms, then the election timeout will be 50ms. Must not be 0.
+/// * `resend_message_tick_timeout`: The number of calls to `tick()` before a message is considered dropped and thus resent. Must not be 0.
+/// * `buffer_size`: The buffer size for outgoing messages.
+/// * `batch_size`: The size of the buffer for log batching. The default is 1, which means no batching.
+/// * `logger_file_path`: The path where the default logger logs events.
+/// * `leader_priority` : Custom priority for this node to be elected as the leader.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "toml_config", derive(Deserialize), serde(default))]
+pub struct ServerConfig {
+    /// The unique identifier of this node. Must not be 0.
+    pub pid: NodeId,
+    /// The number of calls to `tick()` before leader election is updated. If this is set to 5 and `tick()` is called every 10ms, then the election timeout will be 50ms.
+    pub election_tick_timeout: u64,
+    /// The number of calls to `tick()` before a message is considered dropped and thus resent. Must not be 0.
+    pub resend_message_tick_timeout: u64,
+    /// The buffer size for outgoing messages.
+    pub buffer_size: usize,
+    /// The size of the buffer for log batching. The default is 1, which means no batching.
+    pub batch_size: usize,
+    /// The number of calls to `tick()` before the batched log entries are flushed.
+    pub flush_batch_tick_timeout: u64,
+    /// Custom priority for this node to be elected as the leader.
+    pub leader_priority: u32,
+    /// The path where the default logger logs events.
+    #[cfg(feature = "logging")]
+    pub logger_file_path: Option<String>,
+    /// Custom logger, if provided, will be used instead of the default logger.
+    #[cfg(feature = "logging")]
+    #[cfg_attr(feature = "toml_config", serde(skip_deserializing))]
+    pub custom_logger: Option<slog::Logger>,
+}
+
+impl ServerConfig {
+    /// Checks that all the fields of the server config are valid.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        valid_config!(self.pid != 0, "Server pid cannot be 0");
+        valid_config!(self.buffer_size != 0, "Buffer size must be greater than 0");
+        valid_config!(self.batch_size != 0, "Batch size must be greater than 0");
+        valid_config!(
+            self.election_tick_timeout != 0,
+            "Election tick timeout must be greater than 0"
+        );
+        valid_config!(
+            self.resend_message_tick_timeout != 0,
+            "Resend message tick timeout must be greater than 0"
+        );
+        Ok(())
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            election_tick_timeout: ELECTION_TIMEOUT,
+            resend_message_tick_timeout: RESEND_MESSAGE_TIMEOUT,
+            buffer_size: BUFFER_SIZE,
+            batch_size: 1,
+            flush_batch_tick_timeout: FLUSH_BATCH_TIMEOUT,
+            leader_priority: 0,
+            #[cfg(feature = "logging")]
+            logger_file_path: None,
+            #[cfg(feature = "logging")]
+            custom_logger: None,
+        }
+    }
+}
+
+/// The `OmniPaxos` struct represents an OmniPaxos server. Maintains the replicated log that can be read from and appended to.
+/// It also handles incoming messages and produces outgoing messages that you need to fetch and send periodically using your own network implementation.
+pub struct OmniPaxos<T, B>
+where
+    T: Entry,
+    B: Storage<T>,
+{
+    seq_paxos: SequencePaxos<T, B>,
+    ble: BallotLeaderElection,
+    election_clock: LogicalClock,
+    resend_message_clock: LogicalClock,
+    flush_batch_clock: LogicalClock,
+}
+
+impl<T, B> OmniPaxos<T, B>
+where
+    T: Entry,
+    B: Storage<T>,
+{
+    /// Returns the ID of the current leader and whether the node's `Phase` is `Phase::Accepted`.
+    ///
+    /// If the node's phase is `Phase::Accepted`, this implies that the returned leader is also
+    /// in the accepted phase. However, a `Phase::Prepare` or a `false` response does not
+    /// necessarily imply that the leader is not in the accepted phase; it only reflects the current
+    /// phase of this node.
+    pub fn get_current_leader(&self) -> Option<(NodeId, bool)> {
+        let promised_pid = self.seq_paxos.get_promise().pid;
+        if promised_pid == 0 {
+            None
+        } else {
+            let is_accepted = self.seq_paxos.get_state().1 == Phase::Accept;
+            Some((promised_pid, is_accepted))
+        }
+    }
+
+    /// Returns the promised ballot of this node.
+    pub fn get_promise(&self) -> Ballot {
+        self.seq_paxos.get_promise()
+    }
+
+    /// Moves outgoing messages from this server into the buffer. The messages should then be sent via the network implementation.
+    pub fn take_outgoing_messages(&mut self, buffer: &mut Vec<Message<T>>) {
+        self.seq_paxos.take_outgoing_msgs(buffer);
+        buffer.extend(self.ble.outgoing_mut().drain(..).map(|b| Message::BLE(b)));
+    }
+
+    /// Read entry at index `idx` in the log. Returns `None` if `idx` is out of bounds.
+    pub fn read(&self, idx: usize) -> Option<LogEntry<T>> {
+        match self
+            .seq_paxos
+            .internal_storage
+            .read(idx..idx + 1)
+            .expect("storage error while trying to read log entries")
+        {
+            Some(mut v) => v.pop(),
+            None => None,
+        }
+    }
+
+    /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.
+    pub fn read_entries<R>(&self, r: R) -> Option<Vec<LogEntry<T>>>
+    where
+        R: RangeBounds<usize>,
+    {
+        self.seq_paxos
+            .internal_storage
+            .read(r)
+            .expect("storage error while trying to read log entries")
+    }
+
+    /// Read all decided entries starting at `from_idx` (inclusive) in the log. Returns `None` if `from_idx` is out of bounds.
+    pub fn read_decided_suffix(&self, from_idx: usize) -> Option<Vec<LogEntry<T>>> {
+        self.seq_paxos
+            .internal_storage
+            .read_decided_suffix(from_idx)
+            .expect("storage error while trying to read decided log suffix")
+    }
+
+    /// Handle an incoming message
+    pub fn handle_incoming(&mut self, m: Message<T>) {
+        match m {
+            Message::SequencePaxos(p) => self.seq_paxos.handle(p),
+            Message::BLE(b) => self.ble.handle(b),
+        }
+    }
+
+    /// Returns whether this Sequence Paxos has been reconfigured
+    pub fn is_reconfigured(&self) -> Option<StopSign> {
+        self.seq_paxos.is_reconfigured()
+    }
+
+    /// Append an entry to the replicated log.
+    pub fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {
+        self.seq_paxos.append(entry)
+    }
+
+    /// Propose a cluster reconfiguration. Returns an error if the current configuration has already been stopped
+    /// by a previous reconfiguration request or if the `new_configuration` is invalid.
+    /// `new_configuration` defines the cluster-wide configuration settings for the **next** cluster.
+    /// `metadata` is optional data to commit alongside the reconfiguration.
+    pub fn reconfigure(
+        &mut self,
+        new_configuration: ClusterConfig,
+        metadata: Option<Vec<u8>>,
+    ) -> Result<(), ProposeErr<T>> {
+        if let Err(config_error) = new_configuration.validate() {
+            return Err(ProposeErr::ConfigError(
+                config_error,
+                new_configuration,
+                metadata,
+            ));
+        }
+        self.seq_paxos.reconfigure(new_configuration, metadata)
+    }
+
+    /// Handles re-establishing a connection to a previously disconnected peer.
+    /// This should only be called if the underlying network implementation indicates that a connection has been re-established.
+    pub fn reconnected(&mut self, pid: NodeId) {
+        self.seq_paxos.reconnected(pid)
+    }
+
+    /// Increments the internal logical clock. This drives the processes for leader changes, resending dropped messages, and flushing batched log entries.
+    /// Each of these is triggered every `election_tick_timeout`, `resend_message_tick_timeout`, and `flush_batch_tick_timeout` number of calls to this function
+    /// (See how to configure these timeouts in `ServerConfig`).
+    pub fn tick(&mut self) {
+        if self.election_clock.tick_and_check_timeout() {
+            self.election_timeout();
+        }
+        if self.resend_message_clock.tick_and_check_timeout() {
+            self.seq_paxos.resend_message_timeout();
+        }
+        if self.flush_batch_clock.tick_and_check_timeout() {
+            self.seq_paxos.flush_batch_timeout();
+        }
+    }
+
+    /// Manually attempt to become the leader by incrementing this instance's Ballot. Calling this
+    /// function may not result in gainig leadership if other instances are competing for
+    /// leadership with higher Ballots.
+    pub fn try_become_leader(&mut self) {
+        let mut my_ballot = self.ble.get_current_ballot();
+        let promise = self.seq_paxos.get_promise();
+        my_ballot.n = promise.n + 1;
+        self.seq_paxos.handle_leader(my_ballot);
+    }
+
+    /*** BLE calls ***/
+    /// Update the custom priority used in the Ballot for this server. Note that changing the
+    /// priority triggers a leader re-election.
+    pub fn set_priority(&mut self, p: u32) {
+        self.ble.set_priority(p)
+    }
+
+    /// If the heartbeat of a leader is not received when election_timeout() is called, the server might attempt to become the leader.
+    /// It is also used for the election process, where the server checks if it can become the leader.
+    /// For instance if `election_timeout()` is called every 100ms, then if the leader fails, the servers will detect it after 100ms and elect a new server after another 100ms if possible.
+    fn election_timeout(&mut self) {
+        if let Some(new_leader) = self
+            .ble
+            .hb_timeout(self.seq_paxos.get_state(), self.seq_paxos.get_promise())
+        {
+            self.seq_paxos.handle_leader(new_leader);
+        }
+    }
+}
+
+/// An error indicating a failed proposal due to the current cluster configuration being already stopped
+/// or due to an invalid proposed configuration. Returns the failed proposal.
+#[derive(Debug)]
+pub enum ProposeErr<T>
+where
+    T: Entry,
+{
+    /// Couldn't propose entry because a reconfiguration is pending. Returns the failed, proposed entry.
+    PendingReconfigEntry(T),
+    /// Couldn't propose reconfiguration because a reconfiguration is already pending. Returns the failed, proposed `ClusterConfig` and the metadata.
+    /// cluster config and metadata.
+    PendingReconfigConfig(ClusterConfig, Option<Vec<u8>>),
+    /// Couldn't propose reconfiguration because of an invalid cluster config. Contains the config
+    /// error and the failed, proposed cluster config and metadata.
+    ConfigError(ConfigError, ClusterConfig, Option<Vec<u8>>),
+}
+
+/// An error returning the proposal that was failed due to that the current configuration is stopped.
+#[derive(Copy, Clone, Debug)]
+pub enum CompactionErr {
+    /// Snapshot was called with an index that is not decided yet. Returns the currently decided index.
+    UndecidedIndex(usize),
+    /// Snapshot was called with an index which is already trimmed. Returns the currently compacted index.
+    TrimmedIndex(usize),
+    /// Trim was called with an index that is not decided by all servers yet. Returns the index decided by ALL servers currently.
+    NotAllDecided(usize),
+    /// Trim was called at a follower node. Trim must be called by the leader, which is the returned NodeId.
+    NotCurrentLeader(NodeId),
+}
+
+impl Error for CompactionErr {}
+impl Display for CompactionErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self, f)
+    }
+}
+#[cfg(feature = "unicache")]
+/// LFU cache implementation based on the [lfu](https://crates.io/crates/lfu) crate. It has been modified to to support the required operations for UniCache in OmniPaxos.
+pub(crate) mod lfu;
+#[cfg(feature = "unicache")]
+/// UniCache with LFU eviction policy
+pub mod lfu_cache;
+#[cfg(feature = "unicache")]
+/// UniCache with LRU eviction policy
+pub mod lru_cache;
+
+use crate::storage::Entry;
+use num_traits::One;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt::{Debug, Formatter},
+    hash::Hash,
+    marker::PhantomData,
+    num::NonZeroUsize,
+    ops::Add,
+};
+
+#[cfg(not(feature = "serde"))]
+/// The encoded type of a field. If there is a cache hit in UniCache, the field will be replaced and get sent over the network as this type.
+pub trait Encoded: Clone + Debug {}
+#[cfg(not(feature = "serde"))]
+impl<T: Clone + Debug> Encoded for T {}
+#[cfg(feature = "serde")]
+/// The encoded type of a field. If there is a cache hit in UniCache, the field will be replaced and get sent over the network as this type.
+pub trait Encoded: Clone + Debug + Serialize + for<'a> Deserialize<'a> {}
+#[cfg(feature = "serde")]
+impl<T: Clone + Debug + Serialize + for<'a> Deserialize<'a>> Encoded for T {}
+
+#[cfg(not(feature = "serde"))]
+/// The encodable type of a field i.e., a field in Entry that should be considered by UniCache.
+pub trait Encodable: Clone + Debug {}
+#[cfg(not(feature = "serde"))]
+impl<T: Clone + Debug> Encodable for T {}
+#[cfg(feature = "serde")]
+/// The encodable type of a field i.e., a field in Entry that should be considered by UniCache.
+pub trait Encodable: Clone + Debug + Serialize + for<'a> Deserialize<'a> {}
+#[cfg(feature = "serde")]
+impl<T: Clone + Debug + Serialize + for<'a> Deserialize<'a>> Encodable for T {}
+
+#[cfg(not(feature = "serde"))]
+/// Type for those fields in Entry that should not be considered by UniCache.
+pub trait NotEncodable: Clone + Debug {}
+#[cfg(not(feature = "serde"))]
+impl<T: Clone + Debug> NotEncodable for T {}
+#[cfg(feature = "serde")]
+/// Type for those fields in Entry that should not be considered by UniCache.
+pub trait NotEncodable: Clone + Debug + Serialize + for<'a> Deserialize<'a> {}
+#[cfg(feature = "serde")]
+impl<T: Clone + Debug + Serialize + for<'a> Deserialize<'a>> NotEncodable for T {}
+
+/// The UniCache trait. Implement this trait for your own UniCache implementation.
+pub trait UniCache: Clone + Debug {
+    /// The type of the entry that the UniCache will be used for.
+    type T: Entry;
+
+    /// Create a new UniCache instance.
+    fn new() -> Self;
+
+    /// Try to encode an entry by checking if the fields in the entry are in the cache.
+    fn try_encode(&mut self, entry: &Self::T) -> <Self::T as Entry>::EncodeResult;
+
+    /// Decode an entry by replacing the encoded values in the entry with the real cached values.
+    fn decode(&mut self, processed: <Self::T as Entry>::EncodeResult) -> Self::T;
+}
+
+/// The result of an trying to encode a field.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum MaybeEncoded<Encodable, Encoded> {
+    /// Cache hit. The field is replaced with the encoded representation.
+    Encoded(Encoded),
+    /// Cache miss. The field is not replaced and holds the original value.
+    NotEncoded(Encodable),
+}
+
+/// Trait for incrementing a value by one. It is used to generate the encoding values in UniCache.
+pub trait IncrementByOne: Default + Clone + One + Add<Output = Self> {}
+impl<T: Default + Clone + One + Add<Output = Self>> IncrementByOne for T {}
+
+#[cfg(not(feature = "serde"))]
+/// Blanket implementation for types that are encodable by default.
+pub trait DefaultEncodable: Clone + Hash + Eq + PartialEq {}
+#[cfg(not(feature = "serde"))]
+impl<T: Clone + Hash + Eq + PartialEq> DefaultEncodable for T {}
+#[cfg(feature = "serde")]
+/// Blanket implementation for types that are encodable by default.
+pub trait DefaultEncodable:
+    Clone + Hash + Eq + PartialEq + Serialize + for<'a> Deserialize<'a>
+{
+}
+#[cfg(feature = "serde")]
+impl<T: Clone + Hash + Eq + PartialEq + Serialize + for<'a> Deserialize<'a>> DefaultEncodable
+    for T
+{
+}
+
+/// Blanket implementation for types that can be used as Encoded type and can increment by one by default.
+pub trait DefaultEncoded: Clone + IncrementByOne + DefaultEncodable {}
+impl<T: Clone + IncrementByOne + DefaultEncodable> DefaultEncoded for T {}
+
+/// The UniCache of an individual field of an entry.
+pub trait FieldCache<Encodable, Encoded> {
+    /// Create a new UniCache instance.
+    fn new(size: usize) -> Self;
+
+    /// Try to encode the field of an entry by checking if it exists in the cache.
+    fn try_encode(&mut self, field: &Encodable) -> MaybeEncoded<Encodable, Encoded>;
+
+    /// Decode the encoded representation of a field by checking the cache.
+    fn decode(&mut self, result: MaybeEncoded<Encodable, Encoded>) -> Encodable;
+}
+//! LFU cache implementation based on the [lfu](https://crates.io/crates/lfu) crate. It has been modified to to support the required operations for UniCache in OmniPaxos.
+
+#[cfg(feature = "serde")]
+mod serialization;
+
+use linked_hash_set::LinkedHashSet;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{
+        hash_map::{IntoIter, Iter},
+        HashMap,
+    },
+    fmt::Debug,
+    hash::Hash,
+    ops::Index,
+};
+
+#[derive(Clone, Debug)]
+struct LinkedHashSetWrapper<K: Hash + Eq + Clone>(LinkedHashSet<K>);
+
+impl<K: Hash + Eq + Clone> Default for LinkedHashSetWrapper<K> {
+    fn default() -> Self {
+        LinkedHashSetWrapper(LinkedHashSet::default())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct LFUCache<K: Hash + Eq + Clone, V> {
+    values: HashMap<K, ValueCounter<V>>,
+    frequency_bin: HashMap<usize, LinkedHashSetWrapper<K>>,
+    capacity: usize,
+    min_frequency: usize,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+struct ValueCounter<V> {
+    value: V,
+    count: usize,
+}
+
+impl<V> ValueCounter<V> {
+    fn inc(&mut self) {
+        self.count += 1;
+    }
+}
+
+impl<K: Hash + Eq + Clone, V> LFUCache<K, V> {
+    pub fn with_capacity(capacity: usize) -> LFUCache<K, V> {
+        if capacity == 0 {
+            panic!("Unable to create cache: capacity is {:?}", capacity);
+        }
+        LFUCache {
+            values: HashMap::new(),
+            frequency_bin: HashMap::new(),
+            capacity,
+            min_frequency: 0,
+        }
+    }
+
+    pub fn contains(&self, key: &K) -> bool {
+        self.values.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn remove(&mut self, key: K) -> Option<V> {
+        if let Some(value_counter) = self.values.get(&key) {
+            let count = value_counter.count;
+            self.frequency_bin.entry(count).or_default().0.remove(&key);
+            self.values.remove(&key).map(|x| x.value)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the value associated with the given key (if it still exists)
+    /// Method marked as mutable because it internally updates the frequency of the accessed key
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        self.update_frequency_bin(key);
+        self.values.get(key).map(|x| &x.value)
+    }
+
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.update_frequency_bin(key);
+        self.values.get_mut(key).map(|x| &mut x.value)
+    }
+
+    fn update_frequency_bin(&mut self, key: &K) {
+        if let Some(value_counter) = self.values.get_mut(key) {
+            let bin = self.frequency_bin.get_mut(&value_counter.count).unwrap();
+            bin.0.remove(key);
+            let count = value_counter.count;
+            value_counter.inc();
+            if count == self.min_frequency && bin.0.is_empty() {
+                self.min_frequency += 1;
+            }
+            self.frequency_bin
+                .entry(count + 1)
+                .or_default()
+                .0
+                .insert(key.clone());
+        }
+    }
+
+    fn evict(&mut self) {
+        let least_frequently_used_keys = self.frequency_bin.get_mut(&self.min_frequency).unwrap();
+        let least_recently_used = least_frequently_used_keys.0.pop_front().unwrap();
+        self.values.remove(&least_recently_used);
+    }
+
+    pub fn evict_and_return_key(&mut self) -> Option<K> {
+        match self.frequency_bin.get_mut(&self.min_frequency) {
+            Some(least_frequently_used_keys) => {
+                let least_recently_used = least_frequently_used_keys.0.pop_front().unwrap();
+                self.values.remove(&least_recently_used);
+                Some(least_recently_used)
+            }
+            None => None,
+        }
+    }
+
+    pub fn evict_and_return_value(&mut self) -> Option<V> {
+        match self.frequency_bin.get_mut(&self.min_frequency) {
+            Some(least_frequently_used_keys) => {
+                let least_recently_used = least_frequently_used_keys.0.pop_front().unwrap();
+                self.values.remove(&least_recently_used).map(|x| x.value)
+            }
+            None => None,
+        }
+    }
+
+    pub fn iter(&self) -> LfuIterator<K, V> {
+        LfuIterator {
+            values: self.values.iter(),
+        }
+    }
+
+    pub fn set(&mut self, key: K, value: V) {
+        if let Some(value_counter) = self.values.get_mut(&key) {
+            value_counter.value = value;
+            self.update_frequency_bin(&key);
+            return;
+        }
+        if self.len() >= self.capacity {
+            self.evict();
+        }
+        self.values
+            .insert(key.clone(), ValueCounter { value, count: 1 });
+        self.min_frequency = 1;
+        self.frequency_bin
+            .entry(self.min_frequency)
+            .or_default()
+            .0
+            .insert(key);
+    }
+}
+
+pub struct LfuIterator<'a, K, V> {
+    values: Iter<'a, K, ValueCounter<V>>,
+}
+
+pub struct LfuConsumer<K, V> {
+    values: IntoIter<K, ValueCounter<V>>,
+}
+
+impl<K, V> Iterator for LfuConsumer<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.values.next().map(|(k, v)| (k, v.value))
+    }
+}
+
+impl<K: Eq + Hash + Clone, V> IntoIterator for LFUCache<K, V> {
+    type Item = (K, V);
+    type IntoIter = LfuConsumer<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        LfuConsumer {
+            values: self.values.into_iter(),
+        }
+    }
+}
+
+impl<'a, K: Hash + Eq + Clone, V> Iterator for LfuIterator<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.values.next().map(|(key, vc)| (key, &vc.value))
+    }
+}
+
+impl<'a, K: Hash + Eq + Clone, V> IntoIterator for &'a LFUCache<K, V> {
+    type Item = (&'a K, &'a V);
+
+    type IntoIter = LfuIterator<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        return self.iter();
+    }
+}
+
+impl<K: Hash + Eq + Clone, V> Index<K> for LFUCache<K, V> {
+    type Output = V;
+    fn index(&self, index: K) -> &Self::Output {
+        return self.values.get(&index).map(|x| &x.value).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub fn check_equality<K: Clone + Eq + Hash + Debug, V: Eq + Debug>(
+        lfu: &LFUCache<K, V>,
+        lfu2: &LFUCache<K, V>,
+    ) {
+        for (key, vc) in lfu.values.iter() {
+            let (_key2, vc2) = lfu2.values.get_key_value(key).unwrap();
+            assert_eq!(vc.count, vc2.count);
+            assert_eq!(vc.value, vc2.value);
+        }
+        for (fb, fb2) in lfu.frequency_bin.iter().zip(lfu2.frequency_bin.iter()) {
+            assert_eq!(fb.0, fb2.0);
+            assert_eq!(fb.1 .0, fb2.1 .0);
+        }
+    }
+
+    #[test]
+    fn it_works() {
+        let mut lfu = LFUCache::with_capacity(20);
+        lfu.set(10, 10);
+        lfu.set(20, 30);
+        assert_eq!(lfu.get(&10).unwrap(), &10);
+        assert_eq!(lfu.get(&30), None);
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        lfu.set(2, 2);
+        lfu.set(3, 3);
+        assert_eq!(lfu.get(&1), None)
+    }
+
+    #[test]
+    fn test_key_frequency_update() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        lfu.set(2, 2);
+        lfu.set(1, 3);
+        lfu.set(10, 10);
+        assert_eq!(lfu.get(&2), None);
+        assert_eq!(lfu[10], 10);
+    }
+
+    #[test]
+    fn test_lfu_indexing() {
+        let mut lfu: LFUCache<i32, i32> = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        assert_eq!(lfu[1], 1);
+    }
+
+    #[test]
+    fn test_lfu_deletion() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        lfu.set(2, 2);
+        lfu.remove(1);
+        assert_eq!(lfu.get(&1), None);
+        lfu.set(3, 3);
+        lfu.set(4, 4);
+        assert_eq!(lfu.get(&2), None);
+        assert_eq!(lfu.get(&3), Some(&3));
+    }
+
+    #[test]
+    fn test_duplicates() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        lfu.set(1, 2);
+        lfu.set(1, 3);
+        {
+            lfu.set(5, 20);
+        }
+
+        assert_eq!(lfu[1], 3);
+    }
+
+    #[test]
+    fn test_lfu_consumption() {
+        let mut lfu = LFUCache::with_capacity(1);
+        lfu.set(&1, 1);
+        for (_, v) in lfu {
+            assert_eq!(v, 1);
+        }
+    }
+
+    #[test]
+    fn test_lfu_iter() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(&1, 1);
+        lfu.set(&2, 2);
+        for (key, v) in lfu.iter() {
+            match *key {
+                1 => {
+                    assert_eq!(v, &1);
+                }
+                2 => {
+                    assert_eq!(v, &2);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn clone_test() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        lfu.set(2, 2);
+        lfu.set(3, 3);
+
+        let lfu2 = lfu.clone();
+        check_equality(&lfu, &lfu2);
+    }
+
+    #[test]
+    fn evict_and_return_value_test() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        lfu.set(2, 2);
+
+        let _ = lfu.get(&1);
+        let evicted = lfu.evict_and_return_value();
+        assert_eq!(evicted, Some(2));
+
+        lfu.set(3, 3);
+        assert_eq!(lfu.get(&2), None);
+    }
+}
+use super::LinkedHashSetWrapper;
+use linked_hash_set::LinkedHashSet;
+use serde::{de::Visitor, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
+use std::{fmt, hash::Hash};
+
+impl<T> Serialize for LinkedHashSetWrapper<T>
+where
+    T: Serialize + PartialEq + Eq + Hash + Clone,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let len = self.0.len();
+        let mut seq = serializer.serialize_seq(Some(len))?;
+        self.0.iter().for_each(|item| {
+            seq.serialize_element(&item).unwrap();
+        });
+        seq.end()
+    }
+}
+
+impl<'de, T> Deserialize<'de> for LinkedHashSetWrapper<T>
+where
+    T: Deserialize<'de> + Eq + Hash + Clone,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LinkedHashSetVisitor<T> {
+            marker: std::marker::PhantomData<T>,
+        }
+
+        impl<'de, T> Visitor<'de> for LinkedHashSetVisitor<T>
+        where
+            T: Deserialize<'de> + Eq + Hash + Clone,
+        {
+            type Value = LinkedHashSetWrapper<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a sequence of elements")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let size = seq.size_hint().unwrap_or(u8::MAX as usize);
+                let mut lsh = LinkedHashSet::with_capacity(size);
+                while let Some(value) = seq.next_element()? {
+                    lsh.insert(value);
+                }
+                Ok(LinkedHashSetWrapper(lsh))
+            }
+        }
+
+        deserializer.deserialize_seq(LinkedHashSetVisitor {
+            marker: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::super::{tests::check_equality, *};
+
+    #[test]
+    fn ser_test() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        lfu.set(2, 2);
+        lfu.set(3, 3);
+        lfu.set(4, 4);
+
+        let ser = serde_json::to_string(&lfu).unwrap();
+        let lfu2: LFUCache<i32, i32> = serde_json::from_str(&ser).unwrap();
+        check_equality(&lfu2, &lfu);
+    }
+
+    #[test]
+    fn clone_ser_test() {
+        let mut lfu = LFUCache::with_capacity(2);
+        lfu.set(1, 1);
+        lfu.set(2, 2);
+        lfu.set(3, 3);
+        lfu.set(4, 4);
+        let lfu2 = lfu.clone();
+
+        let ser = serde_json::to_string(&lfu2).unwrap();
+        let lfu3: LFUCache<i32, i32> = serde_json::from_str(&ser).unwrap();
+        check_equality(&lfu3, &lfu);
+    }
+}
+use crate::unicache::*;
+use lru::LruCache;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Wrapper to implement serde for LruCache
+struct LruWrapper<Encodable, Encoded>(LruCache<Encodable, Encoded>);
+
+impl<Encodable, Encoded> std::ops::Deref for LruWrapper<Encodable, Encoded> {
+    type Target = LruCache<Encodable, Encoded>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<Encodable, Encoded> std::ops::DerefMut for LruWrapper<Encodable, Encoded> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// UniCache with least-recently-used eviction policy
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg(feature = "serde")]
+#[serde(bound(deserialize = ""))]
+pub struct LRUniCache<Encodable, Encoded>
+where
+    Encodable: DefaultEncodable,
+    Encoded: DefaultEncoded,
+{
+    lru_cache_encoder: LruWrapper<Encodable, Encoded>,
+    lru_cache_decoder: LruWrapper<Encoded, Encodable>,
+    encoding: Encoded,
+    size: usize,
+}
+
+/// UniCache with least-recently-used eviction policy
+#[cfg(not(feature = "serde"))]
+pub struct LRUniCache<Encodable, Encoded>
+where
+    Encodable: DefaultEncodable,
+    Encoded: DefaultEncoded,
+{
+    lru_cache_encoder: LruWrapper<Encodable, Encoded>,
+    lru_cache_decoder: LruWrapper<Encoded, Encodable>,
+    encoding: Encoded,
+    size: usize,
+}
+
+impl<Encodable, Encoded> Clone for LRUniCache<Encodable, Encoded>
+where
+    Encodable: DefaultEncodable,
+    Encoded: DefaultEncoded,
+{
+    /// A cloned version of the cache but *ONLY* with the decoder. The clone is used to send the cache to followers, who will only use the decoder.
+    fn clone(&self) -> Self {
+        let mut cloned_decoder = LruCache::new(NonZeroUsize::new(self.size).unwrap());
+        self.lru_cache_encoder
+            .0
+            .iter()
+            .rev()
+            .for_each(|(encodable, encoded)| {
+                cloned_decoder.push(encoded.clone(), encodable.clone());
+            });
+        Self {
+            lru_cache_encoder: LruWrapper(LruCache::new(NonZeroUsize::new(1).unwrap())),
+            lru_cache_decoder: LruWrapper(cloned_decoder),
+            encoding: self.encoding.clone(),
+            size: self.size,
+        }
+    }
+}
+
+impl<Encodable, Encoded> Debug for LRUniCache<Encodable, Encoded>
+where
+    Encodable: DefaultEncodable,
+    Encoded: DefaultEncoded,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LRUnicache")
+    }
+}
+
+impl<Encodable, Encoded> FieldCache<Encodable, Encoded> for LRUniCache<Encodable, Encoded>
+where
+    Encodable: DefaultEncodable,
+    Encoded: DefaultEncoded,
+{
+    fn new(size: usize) -> Self {
+        let s: NonZeroUsize = NonZeroUsize::new(size).unwrap();
+        Self {
+            lru_cache_encoder: LruWrapper(LruCache::new(s)),
+            lru_cache_decoder: LruWrapper(LruCache::new(s)),
+            encoding: Encoded::default(),
+            size,
+        }
+    }
+
+    fn try_encode(&mut self, field: &Encodable) -> MaybeEncoded<Encodable, Encoded> {
+        match self.lru_cache_encoder.get(field) {
+            Some(encoding) => MaybeEncoded::<Encodable, Encoded>::Encoded(encoding.clone()),
+            None => {
+                if self.lru_cache_encoder.len() == self.size {
+                    // cache is full, replace LRU with new item
+                    let (_, popped_encoding) = self.lru_cache_encoder.pop_lru().unwrap();
+                    self.lru_cache_encoder.push(field.clone(), popped_encoding);
+                } else {
+                    let one = Encoded::one();
+                    let enc = std::mem::take(&mut self.encoding);
+                    let added = enc.add(one);
+                    self.lru_cache_encoder.push(field.clone(), added.clone());
+                    self.encoding = added;
+                }
+                MaybeEncoded::NotEncoded(field.clone())
+            }
+        }
+    }
+
+    fn decode(&mut self, result: MaybeEncoded<Encodable, Encoded>) -> Encodable {
+        match result {
+            MaybeEncoded::Encoded(encoding) => {
+                self.lru_cache_decoder.get(&encoding).unwrap().clone()
+            }
+            MaybeEncoded::NotEncoded(not_encodable) => {
+                if self.lru_cache_decoder.len() == self.size {
+                    // cache is full, replace LRU with new item
+                    let (popped_encoded, _) = self.lru_cache_decoder.pop_lru().unwrap();
+                    self.lru_cache_decoder
+                        .push(popped_encoded, not_encodable.clone());
+                } else {
+                    let one = Encoded::one();
+                    let enc = std::mem::take(&mut self.encoding);
+                    let added = enc.add(one);
+                    self.lru_cache_decoder
+                        .push(added.clone(), not_encodable.clone());
+                    self.encoding = added;
+                }
+                not_encodable
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serialization {
+    use super::*;
+    use serde::{
+        de::{SeqAccess, Visitor},
+        ser::SerializeSeq,
+    };
+
+    impl<Encodable: DefaultEncodable, Encoded: DefaultEncodable> Serialize
+        for LruWrapper<Encodable, Encoded>
+    {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let len = self.0.len();
+            let mut seq = serializer.serialize_seq(Some(len))?;
+            self.0.iter().rev().for_each(|item| {
+                seq.serialize_element(&item).unwrap();
+            });
+            seq.end()
+        }
+    }
+
+    impl<'de, Encodable: DefaultEncodable, Encoded: DefaultEncodable> Deserialize<'de>
+        for LruWrapper<Encodable, Encoded>
+    {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_seq(LruWrapperVisitor::new())
+        }
+    }
+
+    struct LruWrapperVisitor<Encodable, Encoded> {
+        _k: PhantomData<Encodable>,
+        _v: PhantomData<Encoded>,
+    }
+
+    impl<Encodable, Encoded> LruWrapperVisitor<Encodable, Encoded> {
+        fn new() -> Self {
+            Self {
+                _k: PhantomData,
+                _v: PhantomData,
+            }
+        }
+    }
+
+    impl<'de, Encodable, Encoded> Visitor<'de> for LruWrapperVisitor<Encodable, Encoded>
+    where
+        Encodable: DefaultEncodable,
+        Encoded: DefaultEncodable,
+    {
+        type Value = LruWrapper<Encodable, Encoded>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a sequence of key-value pairs")
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            let size = seq.size_hint().unwrap_or(u8::MAX as usize);
+            let mut lru = LruCache::new(NonZeroUsize::new(size).unwrap());
+            while let Some((key, value)) = seq.next_element::<(Encodable, Encoded)>()? {
+                lru.push(key, value);
+            }
+            // Wrap the LruCache in the LruWrapper
+            Ok(LruWrapper(lru))
+        }
+    }
+}
+use crate::unicache::*;
+use lfu::LFUCache;
+
+/// UniCache with least-frequently-used eviction policy
+#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct LFUniCache<Encodable, Encoded>
+where
+    Encodable: Hash + Eq + Clone,
+    Encoded: Hash + Eq + Clone,
+{
+    lfu_cache_encoder: LFUCache<Encodable, Encoded>,
+    lfu_cache_decoder: LFUCache<Encoded, Encodable>,
+    encoding: Encoded,
+    size: usize,
+}
+
+impl<Encodable, Encoded> Clone for LFUniCache<Encodable, Encoded>
+where
+    Encodable: DefaultEncodable,
+    Encoded: DefaultEncoded,
+{
+    /// A cloned version of the cache but *ONLY* with the decoder. The clone is used to send the cache to followers, who will only use the decoder.
+    fn clone(&self) -> Self {
+        let mut lfu_cache_decoder = LFUCache::with_capacity(self.size);
+        self.lfu_cache_encoder
+            .iter()
+            .for_each(|(encodable, encoded)| {
+                lfu_cache_decoder.set(encoded.clone(), encodable.clone());
+            });
+        Self {
+            lfu_cache_encoder: LFUCache::with_capacity(1),
+            lfu_cache_decoder,
+            encoding: self.encoding.clone(),
+            size: self.size,
+        }
+    }
+}
+
+impl<Encodable, Encoded> FieldCache<Encodable, Encoded> for LFUniCache<Encodable, Encoded>
+where
+    Encodable: DefaultEncodable,
+    Encoded: DefaultEncoded,
+{
+    fn new(size: usize) -> Self {
+        Self {
+            lfu_cache_encoder: LFUCache::with_capacity(size),
+            lfu_cache_decoder: LFUCache::with_capacity(size),
+            encoding: Encoded::default(),
+            size,
+        }
+    }
+
+    fn try_encode(&mut self, field: &Encodable) -> MaybeEncoded<Encodable, Encoded> {
+        match self.lfu_cache_encoder.get(field) {
+            Some(encoding) => MaybeEncoded::<Encodable, Encoded>::Encoded(encoding.clone()),
+            None => {
+                if self.lfu_cache_encoder.len() == self.size {
+                    // cache is full, replace LRU with new item
+                    let popped_encoding = self.lfu_cache_encoder.evict_and_return_value().unwrap();
+                    self.lfu_cache_encoder.set(field.clone(), popped_encoding);
+                } else {
+                    let one = Encoded::one();
+                    let enc = std::mem::take(&mut self.encoding);
+                    let added = enc.add(one);
+                    self.lfu_cache_encoder.set(field.clone(), added.clone());
+                    self.encoding = added;
+                }
+                MaybeEncoded::NotEncoded(field.clone())
+            }
+        }
+    }
+
+    fn decode(&mut self, result: MaybeEncoded<Encodable, Encoded>) -> Encodable {
+        match result {
+            MaybeEncoded::Encoded(encoding) => {
+                self.lfu_cache_decoder.get(&encoding).unwrap().clone()
+            }
+            MaybeEncoded::NotEncoded(not_encodable) => {
+                if self.lfu_cache_decoder.len() == self.size {
+                    // cache is full, replace LRU with new item
+                    let popped_encoded = self.lfu_cache_decoder.evict_and_return_key().unwrap();
+                    self.lfu_cache_decoder
+                        .set(popped_encoded, not_encodable.clone());
+                } else {
+                    let one = Encoded::one();
+                    let enc = std::mem::take(&mut self.encoding);
+                    let added = enc.add(one);
+                    self.lfu_cache_decoder
+                        .set(added.clone(), not_encodable.clone());
+                    self.encoding = added;
+                }
+                not_encodable
+            }
+        }
+    }
+}
+pub(crate) mod internal_storage;
+mod state_cache;
+
+use super::ballot_leader_election::Ballot;
+#[cfg(feature = "unicache")]
+use crate::unicache::*;
+use crate::ClusterConfig;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use std::{error::Error, fmt::Debug};
+
+/// Type of the entries stored in the log.
+pub trait Entry: Clone + Debug {
+    #[cfg(not(feature = "serde"))]
+    /// The snapshot type for this entry type.
+    type Snapshot: Snapshot<Self>;
+
+    #[cfg(feature = "serde")]
+    /// The snapshot type for this entry type.
+    type Snapshot: Snapshot<Self> + Serialize + for<'a> Deserialize<'a>;
+
+    #[cfg(feature = "unicache")]
+    /// The encoded type of some data. If there is a cache hit in UniCache, the data will be replaced and get sent over the network as this type instead. E.g., if `u8` then the cached `Entry` (or field of it) will be sent as `u8` instead.
+    type Encoded: Encoded;
+    #[cfg(feature = "unicache")]
+    /// The type representing the encodable parts of an `Entry`. It can be set to `Self` if the whole `Entry` is cachable. See docs of `pre_process()` for an example of deriving `Encodable` from an `Entry`.
+    type Encodable: Encodable;
+    #[cfg(feature = "unicache")]
+    /// The type representing the **NOT** encodable parts of an `Entry`. Any `NotEncodable` data will be transmitted in its original form, without encoding. It can be set to `()` if the whole `Entry` is cachable. See docs of `pre_process()` for an example.
+    type NotEncodable: NotEncodable;
+
+    #[cfg(all(feature = "unicache", not(feature = "serde")))]
+    /// The type that represents if there was a cache hit or miss in UniCache.
+    type EncodeResult: Clone + Debug;
+
+    #[cfg(all(feature = "unicache", feature = "serde"))]
+    /// The type that represents the results of trying to encode i.e., if there was a cache hit or miss in UniCache.
+    type EncodeResult: Clone + Debug + Serialize + for<'a> Deserialize<'a>;
+
+    #[cfg(all(feature = "unicache", not(feature = "serde")))]
+    /// The type that represents the results of trying to encode i.e., if there was a cache hit or miss in UniCache.
+    type UniCache: UniCache<T = Self>;
+    #[cfg(all(feature = "unicache", feature = "serde"))]
+    /// The unicache type for caching popular/re-occurring fields of an entry.
+    type UniCache: UniCache<T = Self> + Serialize + for<'a> Deserialize<'a>;
+}
+
+/// A StopSign entry that marks the end of a configuration. Used for reconfiguration.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct StopSign {
+    /// The new `Omnipaxos` cluster configuration
+    pub next_config: ClusterConfig,
+    /// Metadata for the reconfiguration.
+    pub metadata: Option<Vec<u8>>,
+}
+
+impl StopSign {
+    /// Creates a [`StopSign`].
+    pub fn with(next_config: ClusterConfig, metadata: Option<Vec<u8>>) -> Self {
+        StopSign {
+            next_config,
+            metadata,
+        }
+    }
+}
+
+/// Snapshot type. A `Complete` snapshot contains all snapshotted data while `Delta` has snapshotted changes since an earlier snapshot.
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum SnapshotType<T>
+where
+    T: Entry,
+{
+    Complete(T::Snapshot),
+    Delta(T::Snapshot),
+}
+
+/// Trait for implementing snapshot operations for log entries of type `T` in OmniPaxos.
+pub trait Snapshot<T>: Clone + Debug
+where
+    T: Entry,
+{
+    /// Create a snapshot from the log `entries`.
+    fn create(entries: &[T]) -> Self;
+
+    /// Merge another snapshot `delta` into self.
+    fn merge(&mut self, delta: Self);
+
+    /// Whether `T` is snapshottable. If not, simply return `false` and leave the other functions `unimplemented!()`.
+    fn use_snapshots() -> bool;
+
+    //fn size_hint() -> usize;  // TODO: To let the system know trade-off of using entries vs snapshot?
+}
+
+/// The Result type returned by the storage API.
+pub type StorageResult<T> = Result<T, Box<dyn Error>>;
+
+/// The write operations of the storge implementation.
+#[derive(Debug)]
+pub enum StorageOp<T: Entry> {
+    /// Appends an entry to the end of the log.
+    AppendEntry(T),
+    /// Appends entries to the end of the log.
+    AppendEntries(Vec<T>),
+    /// Appends entries to the log from the prefix specified by the given index.
+    AppendOnPrefix(usize, Vec<T>),
+    /// Sets the round that has been promised.
+    SetPromise(Ballot),
+    /// Sets the decided index in the log.
+    SetDecidedIndex(usize),
+    /// Sets the latest accepted round.
+    SetAcceptedRound(Ballot),
+    /// Sets the compacted (i.e. trimmed or snapshotted) index.
+    SetCompactedIdx(usize),
+    /// Removes elements up to the given idx from storage.
+    Trim(usize),
+    /// Sets the StopSign used for reconfiguration.
+    SetStopsign(Option<StopSign>),
+    /// Sets the snapshot.
+    SetSnapshot(Option<T::Snapshot>),
+}
+
+/// Trait for implementing the storage backend of Sequence Paxos.
+pub trait Storage<T>
+where
+    T: Entry,
+{
+    /// **Atomically** perform all storage operations in order.
+    /// For correctness, the operations must be atomic i.e., either all operations are performed
+    /// successfully or all get rolled back. If the `StorageResult` returns as `Err`, the
+    /// operations are assumed to have been rolled back to the previous state before this function
+    /// call.
+    fn write_atomically(&mut self, ops: Vec<StorageOp<T>>) -> StorageResult<()>;
+
+    /// Appends an entry to the end of the log.
+    fn append_entry(&mut self, entry: T) -> StorageResult<()>;
+
+    /// Appends the entries of `entries` to the end of the log.
+    fn append_entries(&mut self, entries: Vec<T>) -> StorageResult<()>;
+
+    /// Appends the entries of `entries` to the prefix from index `from_index` (inclusive) in the log.
+    fn append_on_prefix(&mut self, from_idx: usize, entries: Vec<T>) -> StorageResult<()>;
+
+    /// Sets the round that has been promised.
+    fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()>;
+
+    /// Sets the decided index in the log.
+    fn set_decided_idx(&mut self, ld: usize) -> StorageResult<()>;
+
+    /// Returns the decided index in the log.
+    fn get_decided_idx(&self) -> StorageResult<usize>;
+
+    /// Sets the latest accepted round.
+    fn set_accepted_round(&mut self, na: Ballot) -> StorageResult<()>;
+
+    /// Returns the latest round in which entries have been accepted, returns `None` if no
+    /// entries have been accepted.
+    fn get_accepted_round(&self) -> StorageResult<Option<Ballot>>;
+
+    /// Returns the entries in the log in the index interval of [from, to).
+    /// If entries **do not exist for the complete interval**, an empty Vector should be returned.
+    fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>>;
+
+    /// Returns the current length of the log (without the trimmed/snapshotted entries).
+    fn get_log_len(&self) -> StorageResult<usize>;
+
+    /// Returns the suffix of entries in the log from index `from` (inclusive).
+    /// If entries **do not exist for the complete interval**, an empty Vector should be returned.
+    fn get_suffix(&self, from: usize) -> StorageResult<Vec<T>>;
+
+    /// Returns the round that has been promised.
+    fn get_promise(&self) -> StorageResult<Option<Ballot>>;
+
+    /// Sets the StopSign used for reconfiguration.
+    fn set_stopsign(&mut self, s: Option<StopSign>) -> StorageResult<()>;
+
+    /// Returns the stored StopSign, returns `None` if no StopSign has been stored.
+    fn get_stopsign(&self) -> StorageResult<Option<StopSign>>;
+
+    /// Removes elements up to the given [`idx`] from storage.
+    fn trim(&mut self, idx: usize) -> StorageResult<()>;
+
+    /// Sets the compacted (i.e. trimmed or snapshotted) index.
+    fn set_compacted_idx(&mut self, idx: usize) -> StorageResult<()>;
+
+    /// Returns the garbage collector index from storage.
+    fn get_compacted_idx(&self) -> StorageResult<usize>;
+
+    /// Sets the snapshot.
+    fn set_snapshot(&mut self, snapshot: Option<T::Snapshot>) -> StorageResult<()>;
+
+    /// Returns the stored snapshot.
+    fn get_snapshot(&self) -> StorageResult<Option<T::Snapshot>>;
+}
+
+/// A place holder type for when not using snapshots. You should not use this type, it is only internally when deriving the Entry implementation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct NoSnapshot;
+
+impl<T: Entry> Snapshot<T> for NoSnapshot {
+    fn create(_entries: &[T]) -> Self {
+        panic!("NoSnapshot should not be created");
+    }
+
+    fn merge(&mut self, _delta: Self) {
+        panic!("NoSnapshot should not be merged");
+    }
+
+    fn use_snapshots() -> bool {
+        false
+    }
+}
+use super::state_cache::StateCache;
+use crate::{
+    CompactionErr,
+    ballot_leader_election::Ballot,
+    storage::{Entry, Snapshot, SnapshotType, StopSign, Storage, StorageOp, StorageResult},
+    util::{IndexEntry, LogEntry, LogSync},
+};
+#[cfg(feature = "unicache")]
+use crate::{unicache::*, util::NodeId};
+use std::{
+    cmp::Ordering,
+    marker::PhantomData,
+    ops::{Bound, RangeBounds},
+};
+
+pub(crate) struct InternalStorageConfig {
+    pub(crate) batch_size: usize,
+}
+
+/// Internal representation of storage. Serves as the interface between Sequence Paxos and the
+/// storage back-end.
+pub(crate) struct InternalStorage<I, T>
+where
+    I: Storage<T>,
+    T: Entry,
+{
+    storage: I,
+    state_cache: StateCache<T>,
+    _t: PhantomData<T>,
+}
+
+#[allow(dead_code)]
+impl<I, T> InternalStorage<I, T>
+where
+    I: Storage<T>,
+    T: Entry,
+{
+    pub(crate) fn with(
+        storage: I,
+        config: InternalStorageConfig,
+        #[cfg(feature = "unicache")] pid: NodeId,
+    ) -> Self {
+        let mut internal_store = InternalStorage {
+            storage,
+            state_cache: StateCache::new(
+                config,
+                #[cfg(feature = "unicache")]
+                pid,
+            ),
+            _t: Default::default(),
+        };
+        internal_store.load_cache();
+        internal_store
+    }
+
+    fn load_cache(&mut self) {
+        self.state_cache.promise = self
+            .storage
+            .get_promise()
+            .expect("Failed to load cache from storage.")
+            .unwrap_or_default();
+        self.state_cache.decided_idx = self.storage.get_decided_idx().unwrap();
+        self.state_cache.accepted_round = self
+            .storage
+            .get_accepted_round()
+            .unwrap()
+            .unwrap_or_default();
+        self.state_cache.compacted_idx = self.storage.get_compacted_idx().unwrap();
+        self.state_cache.stopsign = self.storage.get_stopsign().unwrap();
+        self.state_cache.accepted_idx =
+            self.storage.get_log_len().unwrap() + self.state_cache.compacted_idx;
+        if self.state_cache.stopsign.is_some() {
+            self.state_cache.accepted_idx += 1;
+        }
+    }
+
+    /// Read all decided entries from `from_idx` in the log. Returns `None` if `from_idx` is out of bounds.
+    pub(crate) fn read_decided_suffix(
+        &self,
+        from_idx: usize,
+    ) -> StorageResult<Option<Vec<LogEntry<T>>>> {
+        let decided_idx = self.get_decided_idx();
+        if from_idx < decided_idx {
+            self.read(from_idx..decided_idx)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.
+    pub(crate) fn read<R>(&self, r: R) -> StorageResult<Option<Vec<LogEntry<T>>>>
+    where
+        R: RangeBounds<usize>,
+    {
+        let from_idx = match r.start_bound() {
+            Bound::Included(i) => *i,
+            Bound::Excluded(e) => *e + 1,
+            Bound::Unbounded => 0,
+        };
+        let to_idx = match r.end_bound() {
+            Bound::Included(i) => *i + 1,
+            Bound::Excluded(e) => *e,
+            Bound::Unbounded => self.get_accepted_idx(),
+        };
+        if to_idx == 0 {
+            return Ok(None);
+        }
+        let compacted_idx = self.get_compacted_idx();
+        let accepted_idx = self.get_accepted_idx();
+        // use to_idx-1 when getting the entry type as to_idx is exclusive
+        let to_type = match self.get_entry_type(to_idx - 1, compacted_idx, accepted_idx)? {
+            Some(from_type) => from_type,
+            _ => return Ok(None),
+        };
+        let from_type = match self.get_entry_type(from_idx, compacted_idx, accepted_idx)? {
+            Some(from_type) => from_type,
+            _ => return Ok(None),
+        };
+        match (from_type, to_type) {
+            (IndexEntry::Entry, IndexEntry::Entry) => {
+                Ok(Some(self.create_read_log_entries(from_idx, to_idx)?))
+            }
+            (IndexEntry::Entry, IndexEntry::StopSign(ss)) => {
+                let mut entries = self.create_read_log_entries(from_idx, to_idx - 1)?;
+                entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));
+                Ok(Some(entries))
+            }
+            (IndexEntry::StopSign(ss), IndexEntry::StopSign(_)) => {
+                Ok(Some(vec![LogEntry::StopSign(
+                    ss,
+                    self.stopsign_is_decided(),
+                )]))
+            }
+            e => {
+                unimplemented!("{}", format!("Unexpected read combination: {:?}", e))
+            }
+        }
+    }
+
+    fn get_entry_type(
+        &self,
+        idx: usize,
+        compacted_idx: usize,
+        accepted_idx: usize,
+    ) -> StorageResult<Option<IndexEntry>> {
+        if idx < compacted_idx {
+            Ok(Some(IndexEntry::Compacted))
+        } else if idx + 1 < accepted_idx {
+            Ok(Some(IndexEntry::Entry))
+        } else if idx + 1 == accepted_idx {
+            match self.get_stopsign() {
+                Some(ss) => Ok(Some(IndexEntry::StopSign(ss))),
+                _ => Ok(Some(IndexEntry::Entry)),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn create_read_log_entries(&self, from: usize, to: usize) -> StorageResult<Vec<LogEntry<T>>> {
+        let decided_idx = self.get_decided_idx();
+        let entries = self
+            .get_entries(from, to)?
+            .into_iter()
+            .enumerate()
+            .map(|(idx, e)| {
+                let log_idx = idx + from;
+                if log_idx < decided_idx {
+                    LogEntry::Decided(e)
+                } else {
+                    LogEntry::Undecided(e)
+                }
+            })
+            .collect();
+        Ok(entries)
+    }
+
+    // Append entries in batch, if the batch size is reached, flush the batch and return the
+    // accepted index. If the batch size is not reached, return None.
+    pub(crate) fn append_entries_and_get_accepted_idx(
+        &mut self,
+        entries: Vec<T>,
+    ) -> StorageResult<Option<usize>> {
+        let append_res = self.state_cache.append_entries(entries);
+        if let Some(flushed_entries) = append_res {
+            let accepted_idx = self.append_entries_without_batching(flushed_entries)?;
+            Ok(Some(accepted_idx))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[cfg(feature = "unicache")]
+    pub(crate) fn decode_entries(
+        &mut self,
+        encoded_entries: Vec<<T as Entry>::EncodeResult>,
+    ) -> Vec<T> {
+        encoded_entries
+            .into_iter()
+            .map(|x| self.state_cache.unicache.decode(x))
+            .collect()
+    }
+
+    pub(crate) fn flush_batch(&mut self) -> StorageResult<usize> {
+        #[cfg(feature = "unicache")]
+        {
+            // clear the processed batch
+            self.state_cache.batched_processed_by_leader.clear();
+        }
+        let flushed_entries = self.state_cache.take_batched_entries();
+        self.append_entries_without_batching(flushed_entries)
+    }
+
+    // Append entries without batching, return the accepted index
+    pub(crate) fn append_entries_without_batching(
+        &mut self,
+        entries: Vec<T>,
+    ) -> StorageResult<usize> {
+        let num_new_entries = entries.len();
+        self.storage.append_entries(entries)?;
+        self.state_cache.accepted_idx += num_new_entries;
+        Ok(self.state_cache.accepted_idx)
+    }
+
+    pub(crate) fn sync_log(
+        &mut self,
+        accepted_round: Ballot,
+        decided_idx: usize,
+        log_sync: Option<LogSync<T>>,
+    ) -> StorageResult<usize> {
+        self.state_cache.accepted_round = accepted_round;
+        self.state_cache.decided_idx = decided_idx;
+        let mut sync_txn: Vec<StorageOp<T>> = vec![
+            StorageOp::SetAcceptedRound(accepted_round),
+            StorageOp::SetDecidedIndex(decided_idx),
+        ];
+        if let Some(sync) = log_sync {
+            match sync.decided_snapshot {
+                Some(SnapshotType::Complete(c)) => {
+                    self.state_cache.compacted_idx = sync.sync_idx;
+                    sync_txn.push(StorageOp::Trim(sync.sync_idx));
+                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));
+                    sync_txn.push(StorageOp::SetSnapshot(Some(c)));
+                }
+                Some(SnapshotType::Delta(d)) => {
+                    let mut snapshot = self.create_decided_snapshot()?;
+                    snapshot.merge(d);
+                    self.state_cache.compacted_idx = sync.sync_idx;
+                    sync_txn.push(StorageOp::Trim(sync.sync_idx));
+                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));
+                    sync_txn.push(StorageOp::SetSnapshot(Some(snapshot)));
+                }
+                None => (),
+            }
+            self.state_cache.accepted_idx = sync.sync_idx + sync.suffix.len();
+            sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix));
+            match sync.stopsign {
+                Some(ss) => {
+                    self.state_cache.stopsign = Some(ss.clone());
+                    self.state_cache.accepted_idx += 1;
+                    sync_txn.push(StorageOp::SetStopsign(Some(ss)));
+                }
+                None if self.state_cache.stopsign.is_some() => {
+                    self.state_cache.stopsign = None;
+                    sync_txn.push(StorageOp::SetStopsign(None));
+                }
+                None => (),
+            }
+        }
+        self.storage.write_atomically(sync_txn)?;
+        Ok(self.state_cache.accepted_idx)
+    }
+
+    fn create_decided_snapshot(&mut self) -> StorageResult<T::Snapshot> {
+        let log_decided_idx = self.get_decided_idx_without_stopsign();
+        self.create_snapshot(log_decided_idx)
+    }
+
+    pub(crate) fn create_snapshot(&self, compact_idx: usize) -> StorageResult<T::Snapshot> {
+        let current_compacted_idx = self.get_compacted_idx();
+        if compact_idx < current_compacted_idx {
+            Err(CompactionErr::TrimmedIndex(current_compacted_idx))?
+        }
+        let entries = self
+            .storage
+            .get_entries(current_compacted_idx, compact_idx)?;
+        let delta = T::Snapshot::create(entries.as_slice());
+        match self.storage.get_snapshot()? {
+            Some(mut s) => {
+                s.merge(delta);
+                Ok(s)
+            }
+            None => Ok(delta),
+        }
+    }
+
+    // Creates a Delta snapshot of entries from `from_idx` to the end of the decided log and also
+    // returns the compacted idx of the created snapshot. If the range of entries contains entries
+    // which have already been compacted a valid delta cannot be created, so creates a Complete
+    // snapshot of the entire decided log instead.
+    pub(crate) fn create_diff_snapshot(
+        &self,
+        from_idx: usize,
+    ) -> StorageResult<(Option<SnapshotType<T>>, usize)> {
+        let log_decided_idx = self.get_decided_idx_without_stopsign();
+        let compacted_idx = self.get_compacted_idx();
+        let snapshot = if from_idx <= compacted_idx {
+            // Some entries in range are compacted, snapshot entire decided log
+            if compacted_idx < log_decided_idx {
+                Some(SnapshotType::Complete(
+                    self.create_snapshot(log_decided_idx)?,
+                ))
+            } else {
+                // Entire decided log already snapshotted
+                self.get_snapshot()?.map(|s| SnapshotType::Complete(s))
+            }
+        } else {
+            let diff_entries = self.get_entries(from_idx, log_decided_idx)?;
+            Some(SnapshotType::Delta(T::Snapshot::create(
+                diff_entries.as_slice(),
+            )))
+        };
+        Ok((snapshot, log_decided_idx))
+    }
+
+    pub(crate) fn try_trim(&mut self, idx: usize) -> StorageResult<()> {
+        let decided_idx = self.get_decided_idx();
+        let log_decided_idx = self.get_decided_idx_without_stopsign();
+        let new_compacted_idx = match idx.cmp(&decided_idx) {
+            Ordering::Less => idx,
+            Ordering::Equal => log_decided_idx,
+            Ordering::Greater => Err(CompactionErr::UndecidedIndex(decided_idx))?,
+        };
+        if new_compacted_idx > self.get_compacted_idx() {
+            self.storage.write_atomically(vec![
+                StorageOp::Trim(new_compacted_idx),
+                StorageOp::SetCompactedIdx(new_compacted_idx),
+            ])?;
+            self.state_cache.compacted_idx = new_compacted_idx;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_snapshot(&mut self, snapshot_idx: Option<usize>) -> StorageResult<()> {
+        let decided_idx = self.get_decided_idx();
+        let log_decided_idx = self.get_decided_idx_without_stopsign();
+        let new_compacted_idx = match snapshot_idx {
+            Some(i) => match i.cmp(&decided_idx) {
+                Ordering::Less => i,
+                Ordering::Equal => log_decided_idx,
+                Ordering::Greater => Err(CompactionErr::UndecidedIndex(decided_idx))?,
+            },
+            None => log_decided_idx,
+        };
+        if new_compacted_idx > self.get_compacted_idx() {
+            let snapshot = self.create_snapshot(new_compacted_idx)?;
+            self.storage.write_atomically(vec![
+                StorageOp::Trim(new_compacted_idx),
+                StorageOp::SetCompactedIdx(new_compacted_idx),
+                StorageOp::SetSnapshot(Some(snapshot)),
+            ])?;
+            self.state_cache.compacted_idx = new_compacted_idx;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()> {
+        self.state_cache.promise = n_prom;
+        self.storage.set_promise(n_prom)
+    }
+
+    pub(crate) fn set_decided_idx(&mut self, idx: usize) -> StorageResult<()> {
+        self.state_cache.decided_idx = idx;
+        self.storage.set_decided_idx(idx)
+    }
+
+    pub(crate) fn get_decided_idx(&self) -> usize {
+        self.state_cache.decided_idx
+    }
+
+    fn get_decided_idx_without_stopsign(&self) -> usize {
+        match self.stopsign_is_decided() {
+            true => self.get_decided_idx() - 1,
+            false => self.get_decided_idx(),
+        }
+    }
+
+    pub(crate) fn get_accepted_round(&self) -> Ballot {
+        self.state_cache.accepted_round
+    }
+
+    pub(crate) fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>> {
+        self.storage.get_entries(from, to)
+    }
+
+    /// The length of the replicated log, as if log was never compacted.
+    pub(crate) fn get_accepted_idx(&self) -> usize {
+        self.state_cache.accepted_idx
+    }
+
+    pub(crate) fn get_suffix(&self, from: usize) -> StorageResult<Vec<T>> {
+        self.storage.get_suffix(from)
+    }
+
+    pub(crate) fn get_promise(&self) -> Ballot {
+        self.state_cache.promise
+    }
+
+    pub(crate) fn set_stopsign(&mut self, ss: Option<StopSign>) -> StorageResult<usize> {
+        if ss.is_some() && self.state_cache.stopsign.is_none() {
+            self.state_cache.accepted_idx += 1;
+        } else if ss.is_none() && self.state_cache.stopsign.is_some() {
+            self.state_cache.accepted_idx -= 1;
+        }
+        self.state_cache.stopsign.clone_from(&ss);
+        self.storage.set_stopsign(ss)?;
+        Ok(self.state_cache.accepted_idx)
+    }
+
+    pub(crate) fn get_stopsign(&self) -> Option<StopSign> {
+        self.state_cache.stopsign.clone()
+    }
+
+    // Returns whether a stopsign is decided
+    pub(crate) fn stopsign_is_decided(&self) -> bool {
+        self.state_cache.stopsign_is_decided()
+    }
+
+    pub(crate) fn get_snapshot(&self) -> StorageResult<Option<T::Snapshot>> {
+        self.storage.get_snapshot()
+    }
+
+    pub(crate) fn get_compacted_idx(&self) -> usize {
+        self.state_cache.compacted_idx
+    }
+
+    #[cfg(feature = "unicache")]
+    pub(crate) fn get_unicache(&self) -> T::UniCache {
+        self.state_cache.unicache.clone()
+    }
+
+    #[cfg(feature = "unicache")]
+    pub(crate) fn set_unicache(&mut self, unicache: T::UniCache) {
+        self.state_cache.unicache = unicache;
+    }
+}
+use super::{Entry, StopSign, internal_storage::InternalStorageConfig};
+use crate::ballot_leader_election::Ballot;
+#[cfg(feature = "unicache")]
+use crate::{unicache::*, util::NodeId};
+
+/// A simple in-memory storage for simple state values of OmniPaxos.
+pub(super) struct StateCache<T>
+where
+    T: Entry,
+{
+    #[cfg(feature = "unicache")]
+    /// Id of this node
+    pub pid: NodeId,
+    /// The maximum number of entries to batch.
+    pub batch_size: usize,
+    /// Vector which contains all the logged entries in-memory.
+    pub batched_entries: Vec<T>,
+    /// Last promised round.
+    pub promise: Ballot,
+    /// Last accepted round.
+    pub accepted_round: Ballot,
+    /// Length of the decided log.
+    pub decided_idx: usize,
+    /// Length of the accepted log.
+    pub accepted_idx: usize,
+    /// Garbage collected index.
+    pub compacted_idx: usize,
+    /// Stopsign entry.
+    pub stopsign: Option<StopSign>,
+    #[cfg(feature = "unicache")]
+    /// Batch of entries that are processed (i.e., maybe encoded). Only used by the leader.
+    pub batched_processed_by_leader: Vec<T::EncodeResult>,
+    #[cfg(feature = "unicache")]
+    pub unicache: T::UniCache,
+}
+
+#[allow(dead_code)]
+impl<T> StateCache<T>
+where
+    T: Entry,
+{
+    pub(super) fn new(
+        config: InternalStorageConfig,
+        #[cfg(feature = "unicache")] pid: NodeId,
+    ) -> Self {
+        StateCache {
+            #[cfg(feature = "unicache")]
+            pid,
+            batch_size: config.batch_size,
+            batched_entries: Vec::with_capacity(config.batch_size),
+            promise: Ballot::default(),
+            accepted_round: Ballot::default(),
+            decided_idx: 0,
+            accepted_idx: 0,
+            compacted_idx: 0,
+            stopsign: None,
+            #[cfg(feature = "unicache")]
+            batched_processed_by_leader: Vec::with_capacity(config.batch_size),
+            #[cfg(feature = "unicache")]
+            unicache: T::UniCache::new(),
+        }
+    }
+
+    // Appends an entry to the end of the `batched_entries`. If the batch is full, the
+    // batch is flushed and return flushed entries. Else, return None.
+    pub(super) fn append_entry(&mut self, entry: T) -> Option<Vec<T>> {
+        #[cfg(feature = "unicache")]
+        {
+            let processed = self.unicache.try_encode(&entry);
+            self.batched_processed_by_leader.push(processed);
+        }
+        self.batched_entries.push(entry);
+        self.take_entries_if_batch_is_full()
+    }
+
+    // Appends entries to the end of the `batched_entries`. If the batch is full, the
+    // batch is flushed and return flushed entries. Else, return None.
+    pub(super) fn append_entries(&mut self, entries: Vec<T>) -> Option<Vec<T>> {
+        #[cfg(feature = "unicache")]
+        {
+            if self.promise.pid == self.pid {
+                // only try encoding if we're the leader
+                for entry in &entries {
+                    let processed = self.unicache.try_encode(entry);
+                    self.batched_processed_by_leader.push(processed);
+                }
+            }
+        }
+        self.batched_entries.extend(entries);
+        self.take_entries_if_batch_is_full()
+    }
+
+    // Flushes batched entries and appends a stopsign to the log. Returns the flushed
+    // entries if there were any
+    pub(super) fn append_stopsign(&mut self, ss: StopSign) -> Option<Vec<T>> {
+        self.stopsign = Some(ss);
+        if self.batched_entries.is_empty() {
+            None
+        } else {
+            Some(self.take_batched_entries())
+        }
+    }
+
+    // Return batched entries if the batch is full that need to be flushed in to storage.
+    fn take_entries_if_batch_is_full(&mut self) -> Option<Vec<T>> {
+        if self.batched_entries.len() >= self.batch_size {
+            Some(self.take_batched_entries())
+        } else {
+            None
+        }
+    }
+
+    // Clears the batched entries and returns the cleared entries. If the batch is empty,
+    // return an empty vector.
+    pub(super) fn take_batched_entries(&mut self) -> Vec<T> {
+        std::mem::take(&mut self.batched_entries)
+    }
+
+    #[cfg(feature = "unicache")]
+    pub(super) fn take_batched_processed(&mut self) -> Vec<T::EncodeResult> {
+        std::mem::take(&mut self.batched_processed_by_leader)
+    }
+
+    // Returns whether a stopsign is decided
+    pub(super) fn stopsign_is_decided(&self) -> bool {
+        self.stopsign.is_some() && self.decided_idx == self.accepted_idx
+    }
+}
+use crate::util::NodeId;
+use log::warn;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+use tokio::sync::oneshot;
+use tokio::time;
+
+pub type ClockId = usize;
+
+static CLOCK_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+pub enum ClockError {
+    Ambig(String),
+}
+
+#[derive(Clone)]
+pub struct Clock {
+    state: Arc<Mutex<ClockState>>,
+}
+
+#[allow(dead_code)]
+pub struct ClockState {
+    id: ClockId,
+    master: NodeId,
+    offset: f64,
+    drift: Duration,
+    uncertainty: Duration,
+    sync_freq: u32,
+    logical_time: SystemTime,
+    counter: u32,
+    deadlines: BinaryHeap<Reverse<SystemTime>>,
+    database: HashMap<SystemTime, oneshot::Sender<()>>,
+}
+
+//The clock is a simulator that can be passed configurable parameters to simulate different states of the system. Current setup provides us with the ticking function which is an async function running every 1ms using tokyo interval, meaning if there is overhead in one loop the wait time in the next one will be lowered which will cumulatively average out to 1ms. There is a counter that is counting each tick, once it reaches the sync freq (which is an int representing the number of millis) it is supposed to resync with the leader's clock. To simulate this ill have to check the functionality of the server.rs and network.rs to check how do we incorporate sending messages to the leader and getting the leader's response to resync ourselves. For the proper clock synchronization we will need to incorporate a couple different terms - clock uncertainty which is a metric defining how many millis the manufacturer (in this case us) can guarantee of error bound. The real clock uncertainty is affected by the clock drift after the resyn, or rather the uncertainty is 0 right after the resync and each iteration we add the worst case scenario of the possible drift. Once the clock reaches the error bound no matter where it is in the alg it needs to resync. Furthermore, we need to calculate the latency from the responses and the one way delay (owd) to increase the precision on the clocks. This needs to be simulated in our system due to the fact that there is almost 0 latency sending messages between processes on the same system. There needs to be added a new abstraction - the stateless proxy - which will delegate the tasks from the client to each of the replicas (clusters) an will incorporate the clock sync logic, meaning we will send our resync req here. Inside the reply, the replica includes its current view-id,replica-id, and the request-id of the corresponding request on the fast path.
+
+impl Clock {
+    pub fn new(
+        mas: NodeId,
+        offset: f64,
+        drift: Duration,
+        uncertainty: Duration,
+        sync_freq: u32,
+    ) -> Self {
+        let id = CLOCK_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let master = mas;
+        let logical_time = SystemTime::now();
+        let counter = 0;
+        let state = Arc::new(Mutex::new(ClockState {
+            id,
+            master,
+            offset,
+            drift,
+            uncertainty,
+            sync_freq,
+            logical_time,
+            counter,
+            deadlines: BinaryHeap::new(),
+            database: HashMap::new(),
+        }));
+
+        let clock_ref = Arc::clone(&state);
+        tokio::spawn(async move {
+            Self::tick_fn(clock_ref).await;
+        });
+
+        Self { state }
+    }
+
+    pub async fn tick_fn(clock_ref: Arc<Mutex<ClockState>>) {
+        let mut interval = time::interval(Duration::from_millis(1));
+        let mut rng = StdRng::from_entropy();
+        loop {
+            interval.tick().await;
+            let mut c = clock_ref.lock().unwrap();
+            c.counter += 1;
+            c.logical_time = if rng.gen_bool(0.5) {
+                SystemTime::now() + c.drift
+            } else {
+                SystemTime::now() - c.drift
+            };
+            Self::process_deadlines(&mut c);
+            if c.counter == c.sync_freq {}
+        }
+    }
+
+    fn process_deadlines(c: &mut ClockState) {
+        while c
+            .deadlines
+            .peek()
+            .map(|deadline| deadline.0 < c.logical_time)
+            .unwrap_or(false)
+        {
+            let deadline = c.deadlines.pop().unwrap().0;
+            match c.database.remove(&deadline) {
+                Some(sender) => {
+                    tokio::spawn(async move {
+                        sender.send(()).unwrap();
+                    });
+                }
+                None => {
+                    warn!("database and deadlines are not sync.");
+                }
+            }
+        }
+    }
+
+    pub fn get_time(&self) -> SystemTime {
+        self.state.lock().unwrap().logical_time
+    }
+
+    pub fn get_uncertainty(&self) -> Duration {
+        let state = self.state.lock().unwrap();
+        state.counter * state.drift
+    }
+
+    pub fn resync(&self, real_time: SystemTime) {
+        let mut state = self.state.lock().unwrap();
+        state.logical_time = real_time;
+        state.counter = 0;
+    }
+
+    pub async fn add_deadline(self, deadline: SystemTime) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let mut locked = self.state.lock().unwrap();
+        locked.deadlines.push(Reverse(deadline));
+        locked.database.insert(deadline, tx);
+        rx
+    }
+}

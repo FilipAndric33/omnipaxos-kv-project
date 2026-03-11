@@ -13,6 +13,7 @@ pub struct Proxy {
     sender: UnboundedSender<ProxyCommand>,
 }
 
+#[allow(dead_code)]
 pub enum ProxyCommand {
     ForwardClientMessage { from: ClientId, msg: ClientMessage },
     HandleClockRequest { from: NodeId },
@@ -47,16 +48,15 @@ impl Proxy {
                     }
 
                     ProxyCommand::HandleClockRequest { from } => {
-                        if let Some((_, outbox)) = peer_senders
-                            .iter()
-                            .find(|(id, _)| *id == from) {
-                                let msg: ClusterMessage = ClusterMessage::LeaderTime(from);
-                                if let Err(err) = outbox.send(msg) {
-                                    warn!("Proxy: couldn't send message to node {from} {err}");
-                                }
+                        if let Some((_, outbox)) = peer_senders.iter().find(|(id, _)| *id == from) {
+                            let msg: ClusterMessage = ClusterMessage::LeaderTime(from);
+                            if let Err(err) = outbox.send(msg) {
+                                warn!("Proxy: couldn't send message to node {from} {err}");
                             }
-                        else {
-                            warn!("Proxy: couldn't find the node {from} for the clock resync request.");
+                        } else {
+                            warn!(
+                                "Proxy: couldn't find the node {from} for the clock resync request."
+                            );
                         }
                     }
                 }
@@ -64,9 +64,9 @@ impl Proxy {
             info!("Proxy actor on leader {id} shut down");
         });
 
-        Proxy { 
-            _actor: actor, 
-            sender: tx 
+        Proxy {
+            _actor: actor,
+            sender: tx,
         }
     }
 
@@ -78,10 +78,12 @@ impl Proxy {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn handle_clock_request(&self, from: NodeId) {
         let _ = self.sender.send(ProxyCommand::HandleClockRequest { from });
     }
 
+    #[allow(dead_code)]
     pub fn close(self) {
         self._actor.abort();
     }

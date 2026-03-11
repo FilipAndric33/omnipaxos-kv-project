@@ -1,4 +1,4 @@
-use crate::{kv::KeyValue, server::OmniPaxosServer, util::*};
+use crate::{clock::Clock, kv::KeyValue, server::OmniPaxosServer, util::*};
 use omnipaxos::{
     messages::Message,
     util::{LogEntry, NodeId},
@@ -62,7 +62,9 @@ fn main() {
             cluster_config,
         };
         let omni_paxos: Arc<Mutex<OmniPaxosKV>> = Arc::new(Mutex::new(
-            op_config.build(MemoryStorage::default()).unwrap(),
+            op_config
+                .build(MemoryStorage::default(), Clock::new())
+                .unwrap(),
         ));
         let mut op_server = OmniPaxosServer {
             omni_paxos: Arc::clone(&omni_paxos),

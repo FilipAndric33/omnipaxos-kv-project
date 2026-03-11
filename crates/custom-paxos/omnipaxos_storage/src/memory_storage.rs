@@ -1,3 +1,5 @@
+use std::hash::{DefaultHasher, Hasher};
+
 use omnipaxos::{
     ballot_leader_election::Ballot,
     storage::{Entry, StopSign, Storage, StorageOp, StorageResult},
@@ -30,6 +32,16 @@ impl<T> Storage<T> for MemoryStorage<T>
 where
     T: Entry,
 {
+    fn history_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+
+        for entry in &self.log {
+            entry.hash(&mut hasher);
+        }
+
+        hasher.finish()
+    }
+
     fn write_atomically(&mut self, ops: Vec<StorageOp<T>>) -> StorageResult<()> {
         for op in ops {
             match op {

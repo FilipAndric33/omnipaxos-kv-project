@@ -23,6 +23,7 @@ pub struct Clock {
     state: Arc<Mutex<ClockState>>,
 }
 
+#[allow(dead_code)]
 pub struct ClockState {
     id: ClockId,
     master: NodeId,
@@ -49,7 +50,7 @@ impl Clock {
         let id = CLOCK_COUNTER.fetch_add(1, Ordering::SeqCst);
         let master = mas;
         let logical_time = SystemTime::now();
-        let mut counter = 0;
+        let counter = 0;
         let state = Arc::new(Mutex::new(ClockState {
             id,
             master,
@@ -111,6 +112,11 @@ impl Clock {
 
     pub fn get_time(&self) -> SystemTime {
         self.state.lock().unwrap().logical_time
+    }
+
+    pub fn new_deadline(&self) -> SystemTime {
+        let logical_time = self.state.lock().unwrap().logical_time;
+        logical_time + Duration::from_millis(20)
     }
 
     pub fn get_uncertainty(&self) -> Duration {

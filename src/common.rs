@@ -3,10 +3,8 @@ pub mod messages {
     use serde::{Deserialize, Serialize};
     use std::time::SystemTime;
 
-    use crate::common::kv;
-
     use super::{
-        kv::{Command, CommandId, KVCommand, ClientId},
+        kv::{ClientId, Command, CommandId, KVCommand},
         utils::Timestamp,
     };
 
@@ -22,12 +20,12 @@ pub mod messages {
         LeaderStartSignal(Timestamp),
         LeaderTime(NodeId),
         ClockResponse {
-            real_time: SystemTime
+            real_time: SystemTime,
         },
         ForwardedClientMessage {
             client_id: ClientId,
-            msg: ClientMessage
-        }
+            msg: ClientMessage,
+        },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,83 +52,47 @@ pub mod messages {
 }
 
 pub mod kv {
-    use omnipaxos::{macros::Entry, storage::Snapshot};
+    use omnipaxos::{buffers::Request, macros::Entry};
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::time::SystemTime;
 
     pub type CommandId = usize;
     pub type ClientId = u64;
     pub type NodeId = omnipaxos::util::NodeId;
     pub type InstanceId = NodeId;
 
-    #[derive(Debug, Clone, Entry, Serialize, Deserialize)]
+    #[derive(Debug, Hash, Clone, Entry, Serialize, Deserialize)]
     pub struct Command {
         pub client_id: ClientId,
         pub coordinator_id: NodeId,
         pub id: CommandId,
+        pub deadline: SystemTime,
         pub kv_cmd: KVCommand,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    impl Request for Command {
+        fn get_id(&self) -> usize {
+            self.id
+        }
+
+        fn get_deadline(&self) -> SystemTime {
+            todo!()
+        }
+    }
+
+    #[derive(Debug, Hash, Clone, Serialize, Deserialize)]
     pub enum KVCommand {
         Put(String, String),
         Delete(String),
         Get(String),
     }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub struct KVSnapshot {
-        snapshotted: HashMap<String, String>,
-        deleted_keys: Vec<String>,
-    }
-
-    impl Snapshot<Command> for KVSnapshot {
-        fn create(entries: &[Command]) -> Self {
-            let mut snapshotted = HashMap::new();
-            let mut deleted_keys: Vec<String> = Vec::new();
-            for e in entries {
-                match &e.kv_cmd {
-                    KVCommand::Put(key, value) => {
-                        snapshotted.insert(key.clone(), value.clone());
-                    }
-                    KVCommand::Delete(key) => {
-                        if snapshotted.remove(key).is_none() {
-                            // key was not in the snapshot
-                            deleted_keys.push(key.clone());
-                        }
-                    }
-                    KVCommand::Get(_) => (),
-                }
-            }
-            // remove keys that were put back
-            deleted_keys.retain(|k| !snapshotted.contains_key(k));
-            Self {
-                snapshotted,
-                deleted_keys,
-            }
-        }
-
-        fn merge(&mut self, delta: Self) {
-            for (k, v) in delta.snapshotted {
-                self.snapshotted.insert(k, v);
-            }
-            for k in delta.deleted_keys {
-                self.snapshotted.remove(&k);
-            }
-            self.deleted_keys.clear();
-        }
-
-        fn use_snapshots() -> bool {
-            true
-        }
-    }
 }
 
 pub mod utils {
     use super::messages::*;
-    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::TcpStream;
-    use tokio_serde::{formats::Bincode, Framed};
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio_serde::{Framed, formats::Bincode};
     use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
 
     pub type Timestamp = i64;

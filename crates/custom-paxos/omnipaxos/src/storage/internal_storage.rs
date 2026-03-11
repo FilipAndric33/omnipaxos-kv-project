@@ -1,9 +1,9 @@
 use super::state_cache::StateCache;
 use crate::{
+    CompactionErr,
     ballot_leader_election::Ballot,
     storage::{Entry, Snapshot, SnapshotType, StopSign, Storage, StorageOp, StorageResult},
-    util::{AcceptedMetaData, IndexEntry, LogEntry, LogSync, SnapshottedEntry},
-    CompactionErr,
+    util::{IndexEntry, LogEntry, LogSync},
 };
 #[cfg(feature = "unicache")]
 use crate::{unicache::*, util::NodeId};
@@ -19,16 +19,17 @@ pub(crate) struct InternalStorageConfig {
 
 /// Internal representation of storage. Serves as the interface between Sequence Paxos and the
 /// storage back-end.
-pub(crate) struct InternalStorage<I, T>
+pub struct InternalStorage<I, T>
 where
     I: Storage<T>,
     T: Entry,
 {
-    storage: I,
+    pub storage: I,
     state_cache: StateCache<T>,
     _t: PhantomData<T>,
 }
 
+#[allow(dead_code)]
 impl<I, T> InternalStorage<I, T>
 where
     I: Storage<T>,
@@ -108,9 +109,6 @@ where
         let accepted_idx = self.get_accepted_idx();
         // use to_idx-1 when getting the entry type as to_idx is exclusive
         let to_type = match self.get_entry_type(to_idx - 1, compacted_idx, accepted_idx)? {
-            Some(IndexEntry::Compacted) => {
-                return Ok(Some(vec![self.create_compacted_entry(compacted_idx)?]))
-            }
             Some(from_type) => from_type,
             _ => return Ok(None),
         };
@@ -124,23 +122,6 @@ where
             }
             (IndexEntry::Entry, IndexEntry::StopSign(ss)) => {
                 let mut entries = self.create_read_log_entries(from_idx, to_idx - 1)?;
-                entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));
-                Ok(Some(entries))
-            }
-            (IndexEntry::Compacted, IndexEntry::Entry) => {
-                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);
-                let compacted = self.create_compacted_entry(compacted_idx)?;
-                entries.push(compacted);
-                let mut e = self.create_read_log_entries(compacted_idx, to_idx)?;
-                entries.append(&mut e);
-                Ok(Some(entries))
-            }
-            (IndexEntry::Compacted, IndexEntry::StopSign(ss)) => {
-                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);
-                let compacted = self.create_compacted_entry(compacted_idx)?;
-                entries.push(compacted);
-                let mut e = self.create_read_log_entries(compacted_idx, to_idx - 1)?;
-                entries.append(&mut e);
                 entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));
                 Ok(Some(entries))
             }
@@ -194,64 +175,6 @@ where
         Ok(entries)
     }
 
-    fn create_compacted_entry(&self, compacted_idx: usize) -> StorageResult<LogEntry<T>> {
-        self.storage.get_snapshot().map(|snap| match snap {
-            Some(s) => LogEntry::Snapshotted(SnapshottedEntry::with(compacted_idx, s)),
-            None => LogEntry::Trimmed(compacted_idx),
-        })
-    }
-
-    // Append entry, if the batch size is reached, flush the batch and return the actual
-    // accepted index (not including the batched entries)
-    pub(crate) fn append_entry_with_batching(
-        &mut self,
-        entry: T,
-    ) -> StorageResult<Option<AcceptedMetaData<T>>> {
-        let append_res = self.state_cache.append_entry(entry);
-        self.flush_if_full_batch(append_res)
-    }
-
-    // Append entries in batch, if the batch size is reached, flush the batch and return the
-    // accepted index and the flushed entries. If the batch size is not reached, return None.
-    pub(crate) fn append_entries_with_batching(
-        &mut self,
-        entries: Vec<T>,
-    ) -> StorageResult<Option<AcceptedMetaData<T>>> {
-        let append_res = self.state_cache.append_entries(entries);
-        self.flush_if_full_batch(append_res)
-    }
-
-    // Flushes batched entries and appends a stopsign to the log. Returns the AcceptedMetaData
-    // associated with any flushed entries if there were any.
-    pub(crate) fn append_stopsign(
-        &mut self,
-        ss: StopSign,
-    ) -> StorageResult<Option<AcceptedMetaData<T>>> {
-        let append_res = self.state_cache.append_stopsign(ss.clone());
-        let accepted_entries_metadata = self.flush_if_full_batch(append_res)?;
-        self.storage.set_stopsign(Some(ss))?;
-        self.state_cache.accepted_idx += 1;
-        Ok(accepted_entries_metadata)
-    }
-
-    fn flush_if_full_batch(
-        &mut self,
-        append_res: Option<Vec<T>>,
-    ) -> StorageResult<Option<AcceptedMetaData<T>>> {
-        if let Some(flushed_entries) = append_res {
-            let accepted_idx = self.append_entries_without_batching(flushed_entries.clone())?;
-            Ok(Some(AcceptedMetaData {
-                accepted_idx,
-                #[cfg(not(feature = "unicache"))]
-                entries: flushed_entries,
-                #[cfg(feature = "unicache")]
-                entries: self.state_cache.take_batched_processed(),
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
     // Append entries in batch, if the batch size is reached, flush the batch and return the
     // accepted index. If the batch size is not reached, return None.
     pub(crate) fn append_entries_and_get_accepted_idx(
@@ -286,17 +209,6 @@ where
         }
         let flushed_entries = self.state_cache.take_batched_entries();
         self.append_entries_without_batching(flushed_entries)
-    }
-
-    pub(crate) fn flush_batch_and_get_entries(
-        &mut self,
-    ) -> StorageResult<Option<AcceptedMetaData<T>>> {
-        let flushed_entries = if !self.state_cache.batched_entries.is_empty() {
-            Some(self.state_cache.take_batched_entries())
-        } else {
-            None
-        };
-        self.flush_if_full_batch(flushed_entries)
     }
 
     // Append entries without batching, return the accepted index
@@ -462,7 +374,7 @@ where
         self.storage.set_decided_idx(idx)
     }
 
-    pub(crate) fn get_decided_idx(&self) -> usize {
+    pub fn get_decided_idx(&self) -> usize {
         self.state_cache.decided_idx
     }
 

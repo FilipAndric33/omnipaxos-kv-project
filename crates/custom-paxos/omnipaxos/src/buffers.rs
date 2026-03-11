@@ -45,6 +45,7 @@ impl<R: Request> PartialEq for StoredRequest<R> {
 
 impl<R: Request> Eq for StoredRequest<R> {}
 
+#[allow(dead_code)]
 pub struct Buffers<R: Request> {
     clock: Clock,
     early: BinaryHeap<StoredRequest<R>>,
@@ -52,10 +53,11 @@ pub struct Buffers<R: Request> {
     late: HashMap<usize, R>,
 }
 
-type BuffersRef<R: Request> = Arc<Mutex<Buffers<R>>>;
+pub type BuffersRef<R> = Arc<Mutex<Buffers<R>>>;
 
+#[allow(dead_code)]
 impl<R: Request + 'static> Buffers<R> {
-    fn new(clock: Clock) -> BuffersRef<R> {
+    pub fn new(clock: Clock) -> BuffersRef<R> {
         let buffers = Arc::new(Mutex::new(Buffers {
             clock,
             early: BinaryHeap::new(),
@@ -105,12 +107,12 @@ impl<R: Request + 'static> Buffers<R> {
         }
     }
 
-    async fn insert(buffers: BuffersRef<R>, r: R) -> oneshot::Receiver<R> {
+    pub async fn insert(buffers: BuffersRef<R>, r: R) -> Option<oneshot::Receiver<R>> {
         let (tx, rx) = oneshot::channel();
         let mut locked = buffers.lock().await;
         let r = StoredRequest(r);
         locked.notifiers.insert(r.get_id(), tx);
         locked.early.push(r);
-        rx
+        Some(rx)
     }
 }

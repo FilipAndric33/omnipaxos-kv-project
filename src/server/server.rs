@@ -1,11 +1,9 @@
-use super::proxy::*;
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
 use omnipaxos::clock::*;
 use omnipaxos::{
     OmniPaxos, OmniPaxosConfig,
-    clock::*,
     messages::Message,
     util::{LogEntry, NodeId},
 };

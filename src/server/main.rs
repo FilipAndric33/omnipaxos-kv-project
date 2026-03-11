@@ -4,7 +4,6 @@ use env_logger;
 mod configs;
 mod database;
 mod network;
-mod proxy;
 mod server;
 
 #[tokio::main]

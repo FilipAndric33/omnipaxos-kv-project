@@ -53,7 +53,10 @@ pub mod sequence_paxos {
     where
         T: Entry,
     {
-        Ack(usize, u64, Option<Option<Option<String>>>, usize), // First option is weather we do speculate, second is if the command returns something by definition (for instance a write returns None), third is if weather the action returned something (for instance reading a non-existing variable returns none).
+        // Command ID, Hash, Speculation, last_idx
+        Ack(T, u64, Option<Option<Option<String>>>, usize), // First option is weather we do speculate, second is if the command returns something by definition (for instance a write returns None), third is if weather the action returned something (for instance reading a non-existing variable returns none)
+
+        // Command, last_idx
         Confirm(T, usize),
         NewDeadline(usize, SystemTime),
     }

@@ -15,7 +15,9 @@ where
         accepted_idx: usize,
         e: E,
     ) {
-        e(entry);
+        if matches!(self.state, (Role::Follower, _)) {
+            e(entry);
+        }
         let storage = self.internal_storage.clone();
         tokio::spawn(async move {
             storage
@@ -80,7 +82,7 @@ where
                         .push(Message::SequencePaxos(PaxosMessage {
                             from: mypid,
                             to: proxy,
-                            msg: PaxosMsg::Ack(req.get_id(), hash, speculation, accepted_idx),
+                            msg: PaxosMsg::Ack(req, hash, speculation, accepted_idx),
                         }))
                 }
                 Err(e) => {

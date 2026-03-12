@@ -17,6 +17,8 @@ pub struct Proxy {
     db: Database
 }
 
+//Implement multicast to all connected servers once the client sends a message. Collect a quorum of f + 1 (or whatveer) responses. Collect acks. Check hash values of the sets. The messages arriving as acks will be Ack(T: command, hash: u64, Speculation: Option<Option<Option<String>>>, last_idx: usize) - the leader has speculation has Some instead of None. on the fast path I need the leader + quorum response of acks on the sequence of operations and send it back to the respectful client. Once the client has been sent the ack on the current state send i need to send the Confirm(T: command, last_idx: usize) to everyone so they can update the state.
+
 impl Proxy {
     pub async fn new(config: ProxyConfig) -> Self {
         let quroum = config.nodes.len() - config.fault_tolerance;

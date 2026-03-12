@@ -1,10 +1,8 @@
 pub mod messages {
     use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
     use serde::{Deserialize, Serialize};
-    use std::time::SystemTime;
-
     use super::{
-        kv::{ClientId, Command, CommandId, KVCommand},
+        kv::{Command, CommandId, KVCommand},
         utils::Timestamp,
     };
 
@@ -18,14 +16,6 @@ pub mod messages {
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
-        LeaderTime(NodeId),
-        ClockResponse {
-            real_time: SystemTime,
-        },
-        ForwardedClientMessage {
-            client_id: ClientId,
-            msg: ClientMessage,
-        },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]

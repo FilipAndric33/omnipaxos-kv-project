@@ -192,12 +192,12 @@ impl OmniPaxosServer {
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
-                ClientMessage::Append(id, command) => {
-                    self.append_to_log(from, id, command).await;
+                ClientMessage::Append(command_id, kv_commmand) => {
+                    self.append_to_log(from, command_id,kv_commmand);
                 }
             }
         }
-        self.send_outgoing_msgs().await;
+            self.send_outgoing_msgs();
     }
 
     async fn handle_cluster_messages(
@@ -219,18 +219,6 @@ impl OmniPaxosServer {
                     debug!("Received start message from peer {from}");
                     received_start_signal = true;
                     self.send_client_start_signals(start_time);
-                }
-                ClusterMessage::LeaderTime(from) => {
-                    let cur: SystemTime = self.clock.get_time();
-                    let msg = ClusterMessage::ClockResponse { real_time: cur };
-                    self.network.send_to_cluster(from, msg);
-                }
-                ClusterMessage::ClockResponse { real_time } => {
-                    self.clock.resync(real_time);
-                }
-                ClusterMessage::ForwardedClientMessage { client_id, msg } => {
-                    self.handle_client_messages(&mut vec![(client_id, msg)])
-                        .await;
                 }
             }
         }

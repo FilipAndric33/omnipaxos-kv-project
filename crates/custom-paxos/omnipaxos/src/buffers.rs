@@ -4,7 +4,7 @@ use std::{
     collections::{BinaryHeap, HashMap},
     ops::Deref,
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use tokio::sync::{Mutex, oneshot};
 
@@ -12,6 +12,7 @@ use crate::clock::Clock;
 
 pub trait Request: Send {
     fn get_deadline(&self) -> SystemTime;
+    fn set_deadline(&mut self, deadline: SystemTime);
     fn get_id(&self) -> usize;
 }
 
@@ -50,7 +51,8 @@ pub struct Buffers<R: Request> {
     clock: Clock,
     early: BinaryHeap<StoredRequest<R>>,
     notifiers: HashMap<usize, oneshot::Sender<R>>,
-    late: HashMap<usize, R>,
+    late: HashMap<usize, StoredRequest<R>>,
+    last_released_deadline: Option<SystemTime>,
 }
 
 pub type BuffersRef<R> = Arc<Mutex<Buffers<R>>>;
@@ -63,6 +65,7 @@ impl<R: Request + 'static> Buffers<R> {
             early: BinaryHeap::new(),
             late: HashMap::new(),
             notifiers: HashMap::new(),
+            last_released_deadline: None,
         }));
 
         let buffers_cloned = buffers.clone();
@@ -79,13 +82,18 @@ impl<R: Request + 'static> Buffers<R> {
                 let mut locked = buffers.lock().await;
                 match locked.early.pop() {
                     Some(req) => {
+                        locked.last_released_deadline = Some(req.get_deadline());
                         break (
                             locked.notifiers.remove(&req.get_id()),
                             req,
                             locked.clock.clone(),
                         );
                     }
-                    None => continue,
+                    None => {
+                        drop(locked);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
                 }
             };
             let deadline = req.get_deadline();
@@ -107,12 +115,46 @@ impl<R: Request + 'static> Buffers<R> {
         }
     }
 
-    pub async fn insert(buffers: BuffersRef<R>, r: R) -> Option<oneshot::Receiver<R>> {
+    pub async fn free_from_late(buffers: BuffersRef<R>, id: usize, new_deadline: SystemTime) {
+        let mut locked = buffers.lock().await;
+        match locked.late.remove(&id) {
+            Some(mut r) => {
+                r.0.set_deadline(new_deadline);
+                locked.early.push(r)
+            }
+            None => (),
+        }
+    }
+
+    pub async fn insert(
+        buffers: BuffersRef<R>,
+        r: R,
+        im_leader: bool,
+    ) -> (oneshot::Receiver<R>, Option<SystemTime>) {
         let (tx, rx) = oneshot::channel();
         let mut locked = buffers.lock().await;
-        let r = StoredRequest(r);
+        let mut r = StoredRequest(r);
         locked.notifiers.insert(r.get_id(), tx);
-        locked.early.push(r);
-        Some(rx)
+
+        let eligible = match locked.last_released_deadline {
+            None => true,
+            Some(last) => r.get_deadline() > last,
+        };
+
+        let new_deadline = if eligible {
+            locked.early.push(r);
+            None
+        } else {
+            if im_leader {
+                let new_deadline = locked.clock.new_deadline();
+                r.0.set_deadline(new_deadline);
+                locked.early.push(r);
+                Some(new_deadline)
+            } else {
+                locked.late.insert(r.get_id(), r);
+                None
+            }
+        };
+        (rx, new_deadline)
     }
 }

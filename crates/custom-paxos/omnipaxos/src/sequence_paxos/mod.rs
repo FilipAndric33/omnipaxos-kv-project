@@ -123,7 +123,10 @@ where
     ) {
         match m.msg {
             PaxosMsg::Ack(_, _, _, _) => warn!("should not receiv that."),
-            PaxosMsg::Confirm(c, accepted_idx) => self.handle_execution(c, accepted_idx, e).await,
+            PaxosMsg::Confirm(c, accepted_idx) => self.handle_execution(c, accepted_idx, e),
+            PaxosMsg::NewDeadline(entry_id, new_deadline) => {
+                self.handle_new_deadline(entry_id, new_deadline)
+            }
         }
     }
 

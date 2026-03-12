@@ -15,7 +15,7 @@ pub mod sequence_paxos {
     };
     #[cfg(feature = "serde")]
     use serde::{Deserialize, Serialize};
-    use std::fmt::Debug;
+    use std::{fmt::Debug, time::SystemTime};
 
     /// Message sent by a follower on crash-recovery or dropped messages to request its leader to re-prepare them.
     #[derive(Copy, Clone, Debug)]
@@ -55,6 +55,7 @@ pub mod sequence_paxos {
     {
         Ack(usize, u64, Option<Option<Option<String>>>, usize), // First option is weather we do speculate, second is if the command returns something by definition (for instance a write returns None), third is if weather the action returned something (for instance reading a non-existing variable returns none).
         Confirm(T, usize),
+        NewDeadline(usize, SystemTime),
     }
 
     /// A struct for a Paxos message that also includes sender and receiver.

@@ -76,7 +76,11 @@ pub mod kv {
         }
 
         fn get_deadline(&self) -> SystemTime {
-            todo!()
+            self.deadline
+        }
+
+        fn set_deadline(&mut self, deadline: SystemTime) {
+            self.deadline = deadline
         }
     }
 

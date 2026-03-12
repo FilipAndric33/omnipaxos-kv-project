@@ -192,16 +192,12 @@ impl OmniPaxosServer {
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
-                ClientMessage::Append(_, _) => {
-                    self.handle_single_client_message(from, message);
+                ClientMessage::Append(id, command) => {
+                    self.append_to_log(from, id, command).await;
                 }
             }
         }
         self.send_outgoing_msgs().await;
-    }
-
-    fn handle_single_client_message(&self, _from: ClientId, _msg: ClientMessage) {
-        debug!("here")
     }
 
     async fn handle_cluster_messages(
@@ -233,7 +229,8 @@ impl OmniPaxosServer {
                     self.clock.resync(real_time);
                 }
                 ClusterMessage::ForwardedClientMessage { client_id, msg } => {
-                    self.handle_single_client_message(client_id, msg)
+                    self.handle_client_messages(&mut vec![(client_id, msg)])
+                        .await;
                 }
             }
         }
@@ -241,7 +238,6 @@ impl OmniPaxosServer {
         received_start_signal
     }
 
-    #[allow(dead_code)]
     async fn append_to_log(
         &mut self,
         from: ClientId,

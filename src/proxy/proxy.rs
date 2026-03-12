@@ -1,24 +1,28 @@
-use std::{collections::HashMap};
+use std::{collections::HashMap, sync::Arc};
 use omnipaxos_kv::common::{
     kv::NodeId,
     messages::*, utils::{frame_clients_connection, frame_registration_connection, frame_servers_connection},
 };
 use log::*;
-use tokio::{io::AsyncWriteExt, sync::mpsc::{Receiver, Sender}};
+use tokio::{sync::mpsc::{Receiver, Sender}};
 use tokio::net::{TcpListener, TcpStream};
 use futures::{SinkExt, StreamExt};
+use super::database::*;
 
 use crate::configs::ProxyConfig;
 
 const NETWORK_BATCH_SIZE: usize = 100;
 pub struct Proxy {
     config: ProxyConfig,
+    db: Database
 }
 
 impl Proxy {
     pub async fn new(config: ProxyConfig) -> Self {
+        let quroum = config.nodes.len() - config.fault_tolerance;
         Proxy {
             config,
+            db: Database::new(quroum)
         }
     }
 
@@ -38,8 +42,7 @@ impl Proxy {
         let listen_addr = format!("{}:{}", self.config.listen_address, self.config.listen_port);
         let listener = TcpListener::bind(&listen_addr).await.unwrap_or_else(|e| panic!("Could not bind a proxy listener on {listen_addr}, error: {e}"));
         info!("Proxy listening on {listen_addr}");
-        let fault_tolerance = self.config.fault_tolerance;
-        let num_servers = self.config.nodes.len();
+
         let mut counter: usize = 0;
         loop {
             tokio::select! {
@@ -47,13 +50,14 @@ impl Proxy {
                     info!("Client connected from {sock_addr}");
                     counter += 1;
                     client_stream.set_nodelay(true).unwrap();
-                    tokio::spawn(Self::handle_client_requests(client_stream, server_receivers.remove(&counter).unwrap(), client_senders.remove(&counter).unwrap(), fault_tolerance, num_servers));
+                    let client_db = self.db.clone();
+                    tokio::spawn(Proxy::handle_client_requests(client_db, client_stream, server_receivers.remove(&counter).unwrap(), client_senders.clone(), counter));
                 }
             }
         }
     }
 
-        async fn handle_client_requests(mut client_stream: TcpStream,mut client_receiver: Receiver<ServerMessage>,server_sender: Sender<ClientMessage>, f: usize, num_servers: usize) {
+        async fn handle_client_requests(mut db: Database, mut client_stream: TcpStream,mut client_receiver: Receiver<ServerMessage>, serv_set: HashMap<usize, Sender<ClientMessage>>, connection_id: usize) {
             let mut reg = frame_registration_connection(client_stream);
             match reg.next().await {
                 Some(Ok(RegistrationMessage::ClientRegister)) => {}
@@ -67,7 +71,7 @@ impl Proxy {
 
             let underlying = reg.into_inner().into_inner();
             let (mut reader, mut writer) = frame_servers_connection(underlying);
-            let quorum = f + 1;
+            let serv_set = Arc::new(serv_set);
 
             loop {
                 tokio::select! {
@@ -75,6 +79,7 @@ impl Proxy {
                         match msg {
                             Some(Ok(client_message)) => {
                                 let client_message: ClientMessage = client_message;
+                                let server_sender = serv_set.get(&connection_id).expect("error getting the server sender");
                                 if let Err(e) = server_sender.send(client_message).await {
                                     error!("Error sending message to server. ({e})");
                                     return;
@@ -91,9 +96,23 @@ impl Proxy {
                         }
                     }
                     Some(serv_res) = client_receiver.recv() => {
-                        if let Err(e) = writer.send(serv_res).await {
-                            error!("Failed to send the server response to client ({e})");
-                            return;
+                        if let ServerMessage::Ack(cmd, hash, suspect, last_idx) = serv_res.clone() {
+                            db.handle_command(PRCommand::Put(hash, (0, suspect))).await;
+                            if let Some(val) = db.handle_command(PRCommand::Get(hash)).await {
+                                let val = val.unwrap().clone();
+                                if (val.0 >= db.quorum) && (val.1 != None) {
+                                    for (_, sender) in serv_set.iter() {
+                                        if let Err(e) = sender.send(ClientMessage::Ack(cmd.clone(), last_idx)).await {
+                                            error!("Error while fanning out messages to the servers. ({e})");
+                                            return;
+                                        }
+                                    }
+                                    if let Err(e) = writer.send(serv_res).await {
+                                        error!("Failed to send the server response to client ({e})");
+                                        return;
+                                    }
+                                }
+                            }
                         } 
                     }
                 }

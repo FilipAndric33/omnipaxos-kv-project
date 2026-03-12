@@ -13,6 +13,13 @@ pub mod messages {
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum PRCommand {
+        Put(u64, (usize, Option<Option<Option<String>>>)),
+        Delete(u64),
+        Get(u64),
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClusterMessage {
         OmniPaxosMessage(OmniPaxosMessage<Command>),
         LeaderStartSignal(Timestamp),
@@ -21,12 +28,14 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClientMessage {
         Append(CommandId, KVCommand),
+        Ack(Command, usize)
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
         Write(CommandId),
         Read(CommandId, Option<String>),
+        Ack(Command, u64, Option<Option<Option<String>>>, usize), 
         StartSignal(Timestamp),
     }
 
@@ -35,6 +44,7 @@ pub mod messages {
             match self {
                 ServerMessage::Write(id) => *id,
                 ServerMessage::Read(id, _) => *id,
+                ServerMessage::Ack(c, _, _, _) => c.id,
                 ServerMessage::StartSignal(_) => unimplemented!(),
             }
         }

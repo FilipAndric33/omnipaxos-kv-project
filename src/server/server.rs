@@ -195,9 +195,16 @@ impl OmniPaxosServer {
                 ClientMessage::Append(command_id, kv_commmand) => {
                     self.append_to_log(from, command_id,kv_commmand);
                 }
+                ClientMessage::Ack(_, _) => {
+                    self.handle_ack();
+                }
             }
         }
             self.send_outgoing_msgs();
+    }
+
+    async fn handle_ack(&self) {
+        info!("Received ack on server.");
     }
 
     async fn handle_cluster_messages(

@@ -5,6 +5,7 @@ use env_logger;
 
 mod proxy;
 mod configs;
+mod database;
 
 #[tokio::main]
 pub async fn main() {

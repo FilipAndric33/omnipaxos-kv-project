@@ -37,8 +37,7 @@ impl ClientData {
     }
 
     pub fn new_response(&mut self, command_id: CommandId) {
-        self.request_data
-            .resize(command_id as usize, Default::default());
+        self.request_data.resize(command_id + 1, Default::default());
         let response_time = Utc::now().timestamp_millis();
         self.request_data[command_id].response_time = Some(response_time);
         self.response_count += 1;

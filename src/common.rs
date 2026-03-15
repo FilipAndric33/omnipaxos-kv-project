@@ -1,16 +1,22 @@
 pub mod messages {
-    use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
-    use serde::{Deserialize, Serialize};
-
     use super::{
         kv::{Command, CommandId, KVCommand},
         utils::Timestamp,
     };
+    use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
+    use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum RegistrationMessage {
         NodeRegister(NodeId),
         ClientRegister,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum PRCommand {
+        Put(u64, (usize, Option<Option<Option<String>>>)),
+        Delete(u64),
+        Get(u64),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,12 +28,14 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClientMessage {
         Append(CommandId, KVCommand),
+        Ack(Command, usize),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
         Write(CommandId),
         Read(CommandId, Option<String>),
+        Ack(Command, u64, Option<Option<Option<String>>>, usize),
         StartSignal(Timestamp),
     }
 
@@ -36,6 +44,7 @@ pub mod messages {
             match self {
                 ServerMessage::Write(id) => *id,
                 ServerMessage::Read(id, _) => *id,
+                ServerMessage::Ack(c, _, _, _) => c.id,
                 ServerMessage::StartSignal(_) => unimplemented!(),
             }
         }
@@ -43,9 +52,12 @@ pub mod messages {
 }
 
 pub mod kv {
-    use omnipaxos::{macros::Entry, storage::Snapshot};
+    use omnipaxos::{buffers::Request, macros::Entry};
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::{
+        hash::{Hash, Hasher},
+        time::SystemTime,
+    };
 
     pub type CommandId = usize;
     pub type ClientId = u64;
@@ -57,69 +69,49 @@ pub mod kv {
         pub client_id: ClientId,
         pub coordinator_id: NodeId,
         pub id: CommandId,
+        pub private_id: CommandId,
+        pub deadline: SystemTime,
         pub kv_cmd: KVCommand,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    impl Hash for Command {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+            self.kv_cmd.hash(state);
+        }
+    }
+
+    impl Request for Command {
+        fn get_id(&self) -> usize {
+            self.private_id
+        }
+
+        fn client_id(&self) -> u64 {
+            self.client_id
+        }
+
+        fn get_deadline(&self) -> SystemTime {
+            self.deadline
+        }
+
+        fn set_deadline(&mut self, deadline: SystemTime) {
+            self.deadline = deadline
+        }
+    }
+
+    #[derive(Debug, Hash, Clone, Serialize, Deserialize)]
     pub enum KVCommand {
         Put(String, String),
         Delete(String),
         Get(String),
     }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub struct KVSnapshot {
-        snapshotted: HashMap<String, String>,
-        deleted_keys: Vec<String>,
-    }
-
-    impl Snapshot<Command> for KVSnapshot {
-        fn create(entries: &[Command]) -> Self {
-            let mut snapshotted = HashMap::new();
-            let mut deleted_keys: Vec<String> = Vec::new();
-            for e in entries {
-                match &e.kv_cmd {
-                    KVCommand::Put(key, value) => {
-                        snapshotted.insert(key.clone(), value.clone());
-                    }
-                    KVCommand::Delete(key) => {
-                        if snapshotted.remove(key).is_none() {
-                            // key was not in the snapshot
-                            deleted_keys.push(key.clone());
-                        }
-                    }
-                    KVCommand::Get(_) => (),
-                }
-            }
-            // remove keys that were put back
-            deleted_keys.retain(|k| !snapshotted.contains_key(k));
-            Self {
-                snapshotted,
-                deleted_keys,
-            }
-        }
-
-        fn merge(&mut self, delta: Self) {
-            for (k, v) in delta.snapshotted {
-                self.snapshotted.insert(k, v);
-            }
-            for k in delta.deleted_keys {
-                self.snapshotted.remove(&k);
-            }
-            self.deleted_keys.clear();
-        }
-
-        fn use_snapshots() -> bool {
-            true
-        }
-    }
 }
 
 pub mod utils {
     use super::messages::*;
-    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::TcpStream;
-    use tokio_serde::{formats::Bincode, Framed};
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio_serde::{Framed, formats::Bincode};
     use tokio_util::codec::{Framed as CodecFramed, FramedRead, FramedWrite, LengthDelimitedCodec};
 
     pub type Timestamp = i64;

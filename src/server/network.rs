@@ -42,11 +42,19 @@ fn get_addrs(config: OmniPaxosKVConfig) -> (SocketAddr, Vec<SocketAddr>) {
         .cluster
         .node_addrs
         .into_iter()
-        .map(|addr_str| match addr_str.to_socket_addrs() {
-            Ok(mut addrs) => addrs.next().unwrap(),
-            Err(e) => panic!("Address {addr_str} is invalid: {e}"),
+        .map(|addr_str| {
+            loop {
+                match addr_str.to_socket_addrs() {
+                    Ok(mut addrs) => break addrs.next().unwrap(),
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    }
+                }
+            }
         })
         .collect();
+
     (listen_address, node_addresses)
 }
 
@@ -296,7 +304,7 @@ enum NewConnection {
     ToClient(ClientConnection),
 }
 
-struct PeerConnection {
+pub struct PeerConnection {
     peer_id: NodeId,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
@@ -368,7 +376,7 @@ impl PeerConnection {
     }
 }
 
-struct ClientConnection {
+pub struct ClientConnection {
     client_id: ClientId,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,

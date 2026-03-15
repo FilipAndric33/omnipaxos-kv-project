@@ -12,12 +12,21 @@ futures = "0.3.30"
 tokio = { version = "1.35.1", features = ["full"] }
 tokio-serde = { version = "0.8.0", features = ["bincode"] }
 tokio-util = { version = "0.7.10", features = ["codec"] }
-omnipaxos = { git = "https://github.com/haraldng/omnipaxos.git", features = ["serde", "toml_config"] }
-omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos.git" }
+omnipaxos = { path = "crates/custom-paxos/omnipaxos", features = ["serde", "toml_config"] }
+omnipaxos_storage = { path = "crates/custom-paxos/omnipaxos_storage" }
 chrono = "0.4.34"
 rand = "0.8.5"
 csv = "1.3.1"
 config = "0.15.8"
+
+[patch.crates-io]
+omnipaxos = { path = "crates/custom-paxos/omnipaxos"}
+omnipaxos_storage = { path = "crates/custom-paxos/omnipaxos_storage" }
+
+[patch."https://github.com/haraldng/omnipaxos.git"]
+omnipaxos = { path = "crates/custom-paxos/omnipaxos"}
+omnipaxos_storage = { path = "crates/custom-paxos/omnipaxos_storage" }
+
 
 [[bin]]
 name = "client"
@@ -26,3 +35,7 @@ path = "src/client/main.rs"
 [[bin]]
 name = "server"
 path = "src/server/main.rs"
+
+[[bin]]
+name = "proxy"
+path = "src/proxy/main.rs"

@@ -3,5 +3,6 @@
 
 # Whitelist Rust code
 !src/
+!crates/
 !Cargo.toml
 !Cargo.lock

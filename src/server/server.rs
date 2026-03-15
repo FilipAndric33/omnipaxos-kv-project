@@ -1,14 +1,21 @@
 use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
+use omnipaxos::clock::*;
+use omnipaxos::messages::sequence_paxos::PaxosMessage;
 use omnipaxos::{
-    messages::Message,
-    util::{LogEntry, NodeId},
     OmniPaxos, OmniPaxosConfig,
+    messages::{Message, sequence_paxos::PaxosMsg},
+    util::{LogEntry, NodeId},
 };
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
-use std::{fs::File, io::Write, time::Duration};
+use std::{
+    fs::File,
+    io::Write,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
@@ -16,14 +23,16 @@ const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct OmniPaxosServer {
-    id: NodeId,
-    database: Database,
+    pub id: NodeId,
+    private_command_id: Arc<Mutex<usize>>,
+    database: Arc<Mutex<Database>>,
     network: Network,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
+    pub peers: Vec<NodeId>,
+    pub clock: Clock<Command>,
     config: OmniPaxosKVConfig,
-    peers: Vec<NodeId>,
 }
 
 impl OmniPaxosServer {
@@ -32,17 +41,35 @@ impl OmniPaxosServer {
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
-        let omnipaxos = omnipaxos_config.build(storage).unwrap();
+        let clock = Clock::new(
+            config.local.server_id,
+            0.0,
+            Duration::new(0, 10),
+            Duration::new(10, 0),
+            1000,
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        );
+
+        let omnipaxos = omnipaxos_config
+            .build(storage, clock.clone())
+            .await
+            .unwrap();
+        clock
+            .set_outgoing(omnipaxos.seq_paxos.outgoing.clone())
+            .await;
+
         // Waits for client and server network connections to be established
         let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
         OmniPaxosServer {
             id: config.local.server_id,
-            database: Database::new(),
+            private_command_id: Arc::new(Mutex::new(0)),
+            database: Arc::new(Mutex::new(Database::new())),
             network,
             omnipaxos,
             current_decided_idx: 0,
             omnipaxos_msg_buffer,
             peers: config.get_peers(config.local.server_id),
+            clock,
             config,
         }
     }
@@ -60,8 +87,17 @@ impl OmniPaxosServer {
         loop {
             tokio::select! {
                 _ = election_interval.tick() => {
-                    self.omnipaxos.tick();
-                    self.send_outgoing_msgs();
+                    self.omnipaxos.tick().await;
+                    self.send_outgoing_msgs().await;
+
+                    /*
+                    if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader() {
+                        if is_accept_phase {
+                            if curr_leader == self.id && self.proxy.is_none() {
+                                self.proxy = Some(Proxy::new(self.id.clone(), self.peers.clone(), &mut self.network));
+                            }
+                        }
+                    }*/
                 },
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE) => {
                     self.handle_cluster_messages(&mut cluster_msg_buf).await;
@@ -85,8 +121,8 @@ impl OmniPaxosServer {
         loop {
             tokio::select! {
                 _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
-                    if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader(){
-                        if curr_leader == self.id && is_accept_phase {
+                    if let Some((curr_leader, _)) = self.omnipaxos.get_current_leader().await{
+                        if curr_leader == self.id {
                             info!("{}: Leader fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start);
@@ -95,8 +131,8 @@ impl OmniPaxosServer {
                         }
                     }
                     info!("{}: Attempting to take leadership", self.id);
-                    self.omnipaxos.try_become_leader();
-                    self.send_outgoing_msgs();
+                    self.omnipaxos.try_become_leader().await;
+                    self.send_outgoing_msgs().await;
                 },
                 _ = self.network.cluster_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE) => {
                     let recv_start = self.handle_cluster_messages(cluster_msg_buffer).await;
@@ -111,13 +147,19 @@ impl OmniPaxosServer {
         }
     }
 
-    fn handle_decided_entries(&mut self) {
-        // TODO: Can use a read_raw here to avoid allocation
-        let new_decided_idx = self.omnipaxos.get_decided_idx();
+    async fn handle_decided_entries(&mut self) {
+        let new_decided_idx = self
+            .omnipaxos
+            .seq_paxos
+            .internal_storage
+            .lock()
+            .await
+            .get_decided_idx();
         if self.current_decided_idx < new_decided_idx {
             let decided_entries = self
                 .omnipaxos
                 .read_decided_suffix(self.current_decided_idx)
+                .await
                 .unwrap();
             self.current_decided_idx = new_decided_idx;
             debug!("Decided {new_decided_idx}");
@@ -128,14 +170,13 @@ impl OmniPaxosServer {
                     _ => unreachable!(),
                 })
                 .collect();
-            self.update_database_and_respond(decided_commands);
+            self.update_database_and_respond(decided_commands).await;
         }
     }
 
-    fn update_database_and_respond(&mut self, commands: Vec<Command>) {
-        // TODO: batching responses possible here (batch at handle_cluster_messages)
+    async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         for command in commands {
-            let read = self.database.handle_command(command.kv_cmd);
+            let read = self.database.lock().unwrap().handle_command(command.kv_cmd);
             if command.coordinator_id == self.id {
                 let response = match read {
                     Some(read_result) => ServerMessage::Read(command.id, read_result),
@@ -146,25 +187,57 @@ impl OmniPaxosServer {
         }
     }
 
-    fn send_outgoing_msgs(&mut self) {
+    async fn send_outgoing_msgs(&mut self) {
         self.omnipaxos
-            .take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
+            .take_outgoing_messages(&mut self.omnipaxos_msg_buffer)
+            .await;
         for msg in self.omnipaxos_msg_buffer.drain(..) {
             let to = msg.get_receiver();
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
             self.network.send_to_cluster(to, cluster_msg);
+        }
+
+        self.omnipaxos
+            .take_client_outgoing_messages(&mut self.omnipaxos_msg_buffer)
+            .await;
+        for msg in self.omnipaxos_msg_buffer.drain(..) {
+            let msg = match msg {
+                Message::SequencePaxos(msg) => msg.msg,
+                _ => unreachable!(),
+            };
+            let msg = match msg {
+                PaxosMsg::Ack(a, b, c, d) => ServerMessage::Ack(a, b, c, d),
+                _ => unreachable!(),
+            };
+            self.network.send_to_client(1, msg);
         }
     }
 
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
-                ClientMessage::Append(command_id, kv_command) => {
-                    self.append_to_log(from, command_id, kv_command)
+                ClientMessage::Append(command_id, kv_commmand) => {
+                    self.append_to_log(from, command_id, kv_commmand).await;
+                }
+                ClientMessage::Ack(r, last_idx) => {
+                    let database = self.database.clone();
+                    let execute =
+                        move |entry: Command| database.lock().unwrap().handle_command(entry.kv_cmd);
+                    self.omnipaxos
+                        .seq_paxos
+                        .handle(
+                            PaxosMessage {
+                                from: 10,
+                                to: 10,
+                                msg: PaxosMsg::Confirm(r, last_idx),
+                            },
+                            execute,
+                        )
+                        .await;
                 }
             }
         }
-        self.send_outgoing_msgs();
+        self.send_outgoing_msgs().await;
     }
 
     async fn handle_cluster_messages(
@@ -176,8 +249,11 @@ impl OmniPaxosServer {
             trace!("{}: Received {message:?}", self.id);
             match message {
                 ClusterMessage::OmniPaxosMessage(m) => {
-                    self.omnipaxos.handle_incoming(m);
-                    self.handle_decided_entries();
+                    let database = self.database.clone();
+                    let execute =
+                        move |entry: Command| database.lock().unwrap().handle_command(entry.kv_cmd);
+                    self.omnipaxos.handle_incoming(m, execute).await;
+                    self.handle_decided_entries().await;
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
                     debug!("Received start message from peer {from}");
@@ -186,19 +262,34 @@ impl OmniPaxosServer {
                 }
             }
         }
-        self.send_outgoing_msgs();
+        self.send_outgoing_msgs().await;
         received_start_signal
     }
 
-    fn append_to_log(&mut self, from: ClientId, command_id: CommandId, kv_command: KVCommand) {
-        let command = Command {
-            client_id: from,
-            coordinator_id: self.id,
-            id: command_id,
-            kv_cmd: kv_command,
+    async fn append_to_log(
+        &mut self,
+        from: ClientId,
+        command_id: CommandId,
+        kv_command: KVCommand,
+    ) {
+        let command = {
+            let mut locked = self.private_command_id.lock().unwrap();
+            let command = Command {
+                deadline: self.clock.new_deadline().await,
+                client_id: from,
+                coordinator_id: self.id,
+                private_id: *locked,
+                id: command_id,
+                kv_cmd: kv_command,
+            };
+            *locked = *locked + 1;
+            command
         };
+        let database = self.database.clone();
+        let speculate = move |entry: Command| database.lock().unwrap().handle_command(entry.kv_cmd);
         self.omnipaxos
-            .append(command)
+            .append(command, speculate)
+            .await
             .expect("Append to Omnipaxos log failed");
     }
 

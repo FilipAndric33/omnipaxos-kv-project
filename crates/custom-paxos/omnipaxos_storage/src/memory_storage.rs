@@ -34,7 +34,6 @@ where
 {
     fn history_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
-
         for entry in &self.log {
             entry.hash(&mut hasher);
         }

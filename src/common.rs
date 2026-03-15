@@ -1,10 +1,10 @@
 pub mod messages {
-    use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
-    use serde::{Deserialize, Serialize};
     use super::{
         kv::{Command, CommandId, KVCommand},
         utils::Timestamp,
     };
+    use omnipaxos::{messages::Message as OmniPaxosMessage, util::NodeId};
+    use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum RegistrationMessage {
@@ -28,14 +28,14 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClientMessage {
         Append(CommandId, KVCommand),
-        Ack(Command, usize)
+        Ack(Command, usize),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
         Write(CommandId),
         Read(CommandId, Option<String>),
-        Ack(Command, u64, Option<Option<Option<String>>>, usize), 
+        Ack(Command, u64, Option<Option<Option<String>>>, usize),
         StartSignal(Timestamp),
     }
 
@@ -54,25 +54,40 @@ pub mod messages {
 pub mod kv {
     use omnipaxos::{buffers::Request, macros::Entry};
     use serde::{Deserialize, Serialize};
-    use std::time::SystemTime;
+    use std::{
+        hash::{Hash, Hasher},
+        time::SystemTime,
+    };
 
     pub type CommandId = usize;
     pub type ClientId = u64;
     pub type NodeId = omnipaxos::util::NodeId;
     pub type InstanceId = NodeId;
 
-    #[derive(Debug, Hash, Clone, Entry, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Entry, Serialize, Deserialize)]
     pub struct Command {
         pub client_id: ClientId,
         pub coordinator_id: NodeId,
         pub id: CommandId,
+        pub private_id: CommandId,
         pub deadline: SystemTime,
         pub kv_cmd: KVCommand,
     }
 
+    impl Hash for Command {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+            self.kv_cmd.hash(state);
+        }
+    }
+
     impl Request for Command {
         fn get_id(&self) -> usize {
-            self.id
+            self.private_id
+        }
+
+        fn client_id(&self) -> u64 {
+            self.client_id
         }
 
         fn get_deadline(&self) -> SystemTime {

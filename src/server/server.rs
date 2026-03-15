@@ -2,9 +2,10 @@ use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
 use chrono::Utc;
 use log::*;
 use omnipaxos::clock::*;
+use omnipaxos::messages::sequence_paxos::PaxosMessage;
 use omnipaxos::{
     OmniPaxos, OmniPaxosConfig,
-    messages::Message,
+    messages::{Message, sequence_paxos::PaxosMsg},
     util::{LogEntry, NodeId},
 };
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
@@ -13,7 +14,7 @@ use std::{
     fs::File,
     io::Write,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
@@ -23,13 +24,14 @@ const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct OmniPaxosServer {
     pub id: NodeId,
+    private_command_id: Arc<Mutex<usize>>,
     database: Arc<Mutex<Database>>,
     network: Network,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
     pub peers: Vec<NodeId>,
-    pub clock: Clock,
+    pub clock: Clock<Command>,
     config: OmniPaxosKVConfig,
 }
 
@@ -45,15 +47,22 @@ impl OmniPaxosServer {
             Duration::new(0, 10),
             Duration::new(10, 0),
             1000,
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
         );
+
         let omnipaxos = omnipaxos_config
             .build(storage, clock.clone())
             .await
             .unwrap();
+        clock
+            .set_outgoing(omnipaxos.seq_paxos.outgoing.clone())
+            .await;
+
         // Waits for client and server network connections to be established
         let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
         OmniPaxosServer {
             id: config.local.server_id,
+            private_command_id: Arc::new(Mutex::new(0)),
             database: Arc::new(Mutex::new(Database::new())),
             network,
             omnipaxos,
@@ -112,8 +121,8 @@ impl OmniPaxosServer {
         loop {
             tokio::select! {
                 _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
-                    if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader().await{
-                        if curr_leader == self.id && is_accept_phase {
+                    if let Some((curr_leader, _)) = self.omnipaxos.get_current_leader().await{
+                        if curr_leader == self.id {
                             info!("{}: Leader fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start);
@@ -187,24 +196,48 @@ impl OmniPaxosServer {
             let cluster_msg = ClusterMessage::OmniPaxosMessage(msg);
             self.network.send_to_cluster(to, cluster_msg);
         }
+
+        self.omnipaxos
+            .take_client_outgoing_messages(&mut self.omnipaxos_msg_buffer)
+            .await;
+        for msg in self.omnipaxos_msg_buffer.drain(..) {
+            let msg = match msg {
+                Message::SequencePaxos(msg) => msg.msg,
+                _ => unreachable!(),
+            };
+            let msg = match msg {
+                PaxosMsg::Ack(a, b, c, d) => ServerMessage::Ack(a, b, c, d),
+                _ => unreachable!(),
+            };
+            self.network.send_to_client(1, msg);
+        }
     }
 
     async fn handle_client_messages(&mut self, messages: &mut Vec<(ClientId, ClientMessage)>) {
         for (from, message) in messages.drain(..) {
             match message {
                 ClientMessage::Append(command_id, kv_commmand) => {
-                    self.append_to_log(from, command_id,kv_commmand);
+                    self.append_to_log(from, command_id, kv_commmand).await;
                 }
-                ClientMessage::Ack(_, _) => {
-                    self.handle_ack();
+                ClientMessage::Ack(r, last_idx) => {
+                    let database = self.database.clone();
+                    let execute =
+                        move |entry: Command| database.lock().unwrap().handle_command(entry.kv_cmd);
+                    self.omnipaxos
+                        .seq_paxos
+                        .handle(
+                            PaxosMessage {
+                                from: 10,
+                                to: 10,
+                                msg: PaxosMsg::Confirm(r, last_idx),
+                            },
+                            execute,
+                        )
+                        .await;
                 }
             }
         }
-            self.send_outgoing_msgs();
-    }
-
-    async fn handle_ack(&self) {
-        info!("Received ack on server.");
+        self.send_outgoing_msgs().await;
     }
 
     async fn handle_cluster_messages(
@@ -239,17 +272,23 @@ impl OmniPaxosServer {
         command_id: CommandId,
         kv_command: KVCommand,
     ) {
-        let command = Command {
-            deadline: self.clock.new_deadline(),
-            client_id: from,
-            coordinator_id: self.id,
-            id: command_id,
-            kv_cmd: kv_command,
+        let command = {
+            let mut locked = self.private_command_id.lock().unwrap();
+            let command = Command {
+                deadline: self.clock.new_deadline().await,
+                client_id: from,
+                coordinator_id: self.id,
+                private_id: *locked,
+                id: command_id,
+                kv_cmd: kv_command,
+            };
+            *locked = *locked + 1;
+            command
         };
         let database = self.database.clone();
         let speculate = move |entry: Command| database.lock().unwrap().handle_command(entry.kv_cmd);
         self.omnipaxos
-            .append(from, command, speculate)
+            .append(command, speculate)
             .await
             .expect("Append to Omnipaxos log failed");
     }

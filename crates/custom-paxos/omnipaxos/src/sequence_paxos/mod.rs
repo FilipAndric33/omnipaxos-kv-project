@@ -28,12 +28,13 @@ where
     B: Storage<T>,
 {
     pub internal_storage: Arc<Mutex<InternalStorage<B, T>>>,
-    buffers: BuffersRef<T>,
-    clock: Clock,
+    buffers: BuffersRef<T, T>,
+    clock: Clock<T>,
     pid: NodeId,
     peers: Vec<NodeId>, // excluding self pid
     state: (Role, Phase),
-    outgoing: Arc<Mutex<Vec<Message<T>>>>,
+    pub outgoing: Arc<Mutex<Vec<Message<T>>>>,
+    outgoing_clients: Arc<Mutex<Vec<Message<T>>>>,
     leader_state: LeaderState,
     latest_accepted_meta: Option<(Ballot, usize)>,
 }
@@ -45,7 +46,7 @@ where
 {
     /*** User functions ***/
     /// Creates a Sequence Paxos replica.
-    pub(crate) async fn with(config: SequencePaxosConfig, storage: B, clock: Clock) -> Self {
+    pub(crate) async fn with(config: SequencePaxosConfig, storage: B, clock: Clock<T>) -> Self {
         let pid = config.pid;
         let peers = config.peers;
         let num_nodes = &peers.len() + 1;
@@ -78,7 +79,8 @@ where
             pid,
             peers,
             state,
-            outgoing: Arc::new(Mutex::new(outgoing)),
+            outgoing: Arc::new(Mutex::new(outgoing.clone())),
+            outgoing_clients: Arc::new(Mutex::new(outgoing)),
             leader_state: LeaderState::with(leader, max_pid, quorum),
             latest_accepted_meta: None,
         };
@@ -115,18 +117,31 @@ where
         self.latest_accepted_meta = None;
     }
 
+    /// Moves the outgoing messages from this replica into the buffer. The messages should then be sent via the network implementation.
+    /// If `buffer` is empty, it gets swapped with the internal message buffer. Otherwise, messages are appended to the buffer. This prevents messages from getting discarded.
+    /// the buffer.
+    pub(crate) async fn take_outgoing_client_msgs(&mut self, buffer: &mut Vec<Message<T>>) {
+        if buffer.is_empty() {
+            let mut locked = self.outgoing_clients.lock().await;
+            std::mem::swap(buffer, &mut locked);
+        } else {
+            // User has unsent messages in their buffer, must extend their buffer.
+            let mut locked = self.outgoing_clients.lock().await;
+            buffer.append(&mut locked);
+        }
+        self.latest_accepted_meta = None;
+    }
+
     /// Handle an incoming message.
-    pub(crate) async fn handle<E: Fn(T) -> Option<Option<String>>>(
-        &mut self,
-        m: PaxosMessage<T>,
-        e: E,
-    ) {
+    pub async fn handle<E: Fn(T) -> Option<Option<String>>>(&mut self, m: PaxosMessage<T>, e: E) {
         match m.msg {
             PaxosMsg::Ack(_, _, _, _) => warn!("should not receiv that."),
             PaxosMsg::Confirm(c, accepted_idx) => self.handle_execution(c, accepted_idx, e),
             PaxosMsg::NewDeadline(entry_id, new_deadline) => {
                 self.handle_new_deadline(entry_id, new_deadline)
             }
+            PaxosMsg::SyncAnswer(t) => self.handle_resync_answer(t),
+            PaxosMsg::SyncReq => self.handle_resync_request(m.from),
         }
     }
 
@@ -147,14 +162,13 @@ where
     /// Append an entry to the replicated log.
     pub(crate) async fn append<S: Fn(T) -> Option<Option<String>>>(
         &mut self,
-        proxy: NodeId,
         entry: T,
         s: S,
     ) -> Result<(), ProposeErr<T>> {
         if self.accepted_reconfiguration().await {
             Err(ProposeErr::PendingReconfigEntry(entry))
         } else {
-            self.propose_entry(proxy, entry, s);
+            self.propose_entry(entry, s);
             Ok(())
         }
     }
@@ -190,10 +204,10 @@ where
         }
     }
 
-    fn propose_entry<S: Fn(T) -> Option<Option<String>>>(&mut self, proxy: NodeId, entry: T, s: S) {
+    fn propose_entry<S: Fn(T) -> Option<Option<String>>>(&mut self, entry: T, s: S) {
         match self.state {
-            (Role::Follower, _) => self.handle_new_proposal(proxy, entry, false, s),
-            (Role::Leader, _) => self.handle_new_proposal(proxy, entry, true, s),
+            (Role::Follower, _) => self.handle_new_proposal(entry, false, s),
+            (Role::Leader, _) => self.handle_new_proposal(entry, true, s),
         }
     }
 

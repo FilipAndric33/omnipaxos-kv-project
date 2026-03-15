@@ -1,4 +1,4 @@
-use log::warn;
+use log::{info, warn};
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
@@ -8,12 +8,13 @@ use std::{
 };
 use tokio::sync::{Mutex, oneshot};
 
-use crate::clock::Clock;
+use crate::{clock::Clock, storage::Entry};
 
 pub trait Request: Send {
     fn get_deadline(&self) -> SystemTime;
     fn set_deadline(&mut self, deadline: SystemTime);
     fn get_id(&self) -> usize;
+    fn client_id(&self) -> u64;
 }
 
 struct StoredRequest<R: Request>(R);
@@ -47,19 +48,19 @@ impl<R: Request> PartialEq for StoredRequest<R> {
 impl<R: Request> Eq for StoredRequest<R> {}
 
 #[allow(dead_code)]
-pub struct Buffers<R: Request> {
-    clock: Clock,
+pub struct Buffers<R: Request, T: Entry> {
+    clock: Clock<T>,
     early: BinaryHeap<StoredRequest<R>>,
     notifiers: HashMap<usize, oneshot::Sender<R>>,
     late: HashMap<usize, StoredRequest<R>>,
     last_released_deadline: Option<SystemTime>,
 }
 
-pub type BuffersRef<R> = Arc<Mutex<Buffers<R>>>;
+pub type BuffersRef<R, T> = Arc<Mutex<Buffers<R, T>>>;
 
 #[allow(dead_code)]
-impl<R: Request + 'static> Buffers<R> {
-    pub fn new(clock: Clock) -> BuffersRef<R> {
+impl<R: Request + 'static, T: Entry> Buffers<R, T> {
+    pub fn new(clock: Clock<T>) -> BuffersRef<R, T> {
         let buffers = Arc::new(Mutex::new(Buffers {
             clock,
             early: BinaryHeap::new(),
@@ -76,7 +77,7 @@ impl<R: Request + 'static> Buffers<R> {
         buffers
     }
 
-    async fn waiter(buffers: BuffersRef<R>) {
+    async fn waiter(buffers: BuffersRef<R, T>) {
         loop {
             let (sender, req, clock) = loop {
                 let mut locked = buffers.lock().await;
@@ -115,7 +116,7 @@ impl<R: Request + 'static> Buffers<R> {
         }
     }
 
-    pub async fn free_from_late(buffers: BuffersRef<R>, id: usize, new_deadline: SystemTime) {
+    pub async fn free_from_late(buffers: BuffersRef<R, T>, id: usize, new_deadline: SystemTime) {
         let mut locked = buffers.lock().await;
         match locked.late.remove(&id) {
             Some(mut r) => {
@@ -127,7 +128,7 @@ impl<R: Request + 'static> Buffers<R> {
     }
 
     pub async fn insert(
-        buffers: BuffersRef<R>,
+        buffers: BuffersRef<R, T>,
         r: R,
         im_leader: bool,
     ) -> (oneshot::Receiver<R>, Option<SystemTime>) {
@@ -141,12 +142,13 @@ impl<R: Request + 'static> Buffers<R> {
             Some(last) => r.get_deadline() > last,
         };
 
+        info!("Pusing {}", r.get_id());
         let new_deadline = if eligible {
             locked.early.push(r);
             None
         } else {
             if im_leader {
-                let new_deadline = locked.clock.new_deadline();
+                let new_deadline = locked.clock.new_deadline().await;
                 r.0.set_deadline(new_deadline);
                 locked.early.push(r);
                 Some(new_deadline)

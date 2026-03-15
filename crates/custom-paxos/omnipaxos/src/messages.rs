@@ -59,6 +59,8 @@ pub mod sequence_paxos {
         // Command, last_idx
         Confirm(T, usize),
         NewDeadline(usize, SystemTime),
+        SyncReq,
+        SyncAnswer(SystemTime),
     }
 
     /// A struct for a Paxos message that also includes sender and receiver.

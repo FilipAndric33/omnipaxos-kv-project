@@ -33,9 +33,28 @@ where
         tokio::spawn(async move { Buffers::free_from_late(buffers, id, new_deadline).await });
     }
 
+    pub(crate) fn handle_resync_answer(&self, t: SystemTime) {
+        let clock = self.clock.clone();
+        tokio::spawn(async move { clock.state.lock().await.master_time_sender.send(t).await });
+    }
+
+    pub(crate) fn handle_resync_request(&self, from: NodeId) {
+        let clock = self.clock.clone();
+        let outgoing = self.outgoing.clone();
+        tokio::spawn(async move {
+            outgoing
+                .lock()
+                .await
+                .push(Message::SequencePaxos(PaxosMessage {
+                    from: 1,
+                    to: from,
+                    msg: PaxosMsg::SyncAnswer(clock.get_time().await),
+                }));
+        });
+    }
+
     pub(crate) fn handle_new_proposal<S: Fn(T) -> Option<Option<String>>>(
         &mut self,
-        proxy: NodeId,
         entry: T,
         im_leader: bool,
         speculate: S,
@@ -46,6 +65,7 @@ where
             None
         };
         let outgoing = self.outgoing.clone();
+        let client_outgoing = self.outgoing_clients.clone();
         let mypid = self.pid;
         let entry_id = entry.get_id();
         let peers = self.peers.clone();
@@ -76,12 +96,12 @@ where
                             locked.storage.history_hash(),
                         )
                     };
-                    outgoing
+                    client_outgoing
                         .lock()
                         .await
                         .push(Message::SequencePaxos(PaxosMessage {
                             from: mypid,
-                            to: proxy,
+                            to: req.client_id(),
                             msg: PaxosMsg::Ack(req, hash, speculation, accepted_idx),
                         }))
                 }

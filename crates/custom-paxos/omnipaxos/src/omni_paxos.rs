@@ -10,6 +10,7 @@ use crate::{
         defaults::{BUFFER_SIZE, ELECTION_TIMEOUT, FLUSH_BATCH_TIMEOUT, RESEND_MESSAGE_TIMEOUT},
     },
 };
+use log::info;
 #[cfg(any(feature = "toml_config", feature = "serde"))]
 use serde::Deserialize;
 #[cfg(feature = "serde")]
@@ -58,7 +59,11 @@ impl OmniPaxosConfig {
     }
 
     /// Checks all configuration fields and returns the local OmniPaxos node if successful.
-    pub async fn build<T, B>(self, storage: B, clock: Clock) -> Result<OmniPaxos<T, B>, ConfigError>
+    pub async fn build<T, B>(
+        self,
+        storage: B,
+        clock: Clock<T>,
+    ) -> Result<OmniPaxos<T, B>, ConfigError>
     where
         T: Entry,
         B: Storage<T>,
@@ -132,7 +137,7 @@ impl ClusterConfig {
         self,
         server_config: ServerConfig,
         with_storage: B,
-        clock: Clock,
+        clock: Clock<T>,
     ) -> Result<OmniPaxos<T, B>, ConfigError>
     where
         T: Entry,
@@ -261,6 +266,11 @@ where
         buffer.extend(self.ble.outgoing_mut().drain(..).map(|b| Message::BLE(b)));
     }
 
+    /// Moves outgoing messages from this server into the buffer. The messages should then be sent via the network implementation.
+    pub async fn take_client_outgoing_messages(&mut self, buffer: &mut Vec<Message<T>>) {
+        self.seq_paxos.take_outgoing_client_msgs(buffer).await;
+    }
+
     /// Read entry at index `idx` in the log. Returns `None` if `idx` is out of bounds.
     pub async fn read(&self, idx: usize) -> Option<LogEntry<T>> {
         match self
@@ -319,11 +329,10 @@ where
     /// Append an entry to the replicated log.
     pub async fn append<S: Fn(T) -> Option<Option<String>>>(
         &mut self,
-        proxy: NodeId,
         entry: T,
         s: S,
     ) -> Result<(), ProposeErr<T>> {
-        self.seq_paxos.append(proxy, entry, s).await
+        self.seq_paxos.append(entry, s).await
     }
 
     /// Propose a cluster reconfiguration. Returns an error if the current configuration has already been stopped
@@ -369,6 +378,7 @@ where
         let mut my_ballot = self.ble.get_current_ballot();
         let promise = self.seq_paxos.get_promise().await;
         my_ballot.n = promise.n + 1;
+        info!("{}", my_ballot.n);
         self.seq_paxos.handle_leader(my_ballot).await;
     }
 

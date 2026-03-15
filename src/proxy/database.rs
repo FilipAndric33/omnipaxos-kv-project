@@ -1,6 +1,6 @@
-use tokio::sync::Mutex;
 use omnipaxos_kv::common::messages::PRCommand;
 use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct Database {
@@ -10,39 +10,28 @@ pub struct Database {
 
 impl Database {
     pub fn new(q: usize) -> Self {
-        Self { 
+        Self {
             db: Arc::new(Mutex::new(HashMap::new())),
-            quorum: q
+            quorum: q,
         }
     }
 
-    pub async fn handle_command(&mut self, command: PRCommand) -> Option<Option<(usize, Option<Option<Option<String>>>)>> {
+    pub async fn handle_command(
+        &mut self,
+        command: PRCommand,
+    ) -> Option<Option<(usize, Option<Option<Option<String>>>)>> {
         let mut db = self.db.lock().await;
 
         match command {
-            PRCommand::Put(key, (_, sus)) => {
-                if let Some(val) = db.get(&key).cloned() {
-                    if  let Some(res) = &val.1 {
-                        db.insert(key, (val.0 + 1, Some(res.clone())));
-                        None
-                    } else {
-                        if let Some(res) = sus {
-                            db.insert(key, (val.0 + 1, Some(res)));
-                            None
-                        } else {
-                            db.insert(key, (val.0 + 1, val.1.clone()));
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
+            PRCommand::Put(key, val) => {
+                db.insert(key, val);
+                None
             }
             PRCommand::Delete(key) => {
                 db.remove(&key);
                 None
             }
-            PRCommand::Get(key) => { Some(db.get(&key).cloned()) }
+            PRCommand::Get(key) => Some(db.get(&key).cloned()),
         }
     }
 }

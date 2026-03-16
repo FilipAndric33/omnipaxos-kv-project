@@ -1,7 +1,6 @@
 use crate::{
     ballot_leader_election::Ballot,
     messages::ballot_leader_election::HeartbeatReply,
-    storage::Entry,
     util::{LeaderState, NodeId},
 };
 
@@ -15,18 +14,9 @@ pub struct ClusterState {
     pub heartbeats: Vec<HeartbeatReply>,
 }
 
-impl<T> From<&LeaderState<T>> for ClusterState
-where
-    T: Entry,
-{
-    fn from(leader_state: &LeaderState<T>) -> Self {
-        let mut accepted_indexes = leader_state.accepted_indexes.clone();
-        // Add one empty entry at the beginning to make the index of the vector sync with node id.
-        accepted_indexes.insert(0, 0);
-        Self {
-            accepted_indexes,
-            heartbeats: vec![],
-        }
+impl From<&LeaderState> for ClusterState {
+    fn from(_leader_state: &LeaderState) -> Self {
+        unreachable!()
     }
 }
 

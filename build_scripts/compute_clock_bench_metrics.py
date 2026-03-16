@@ -25,28 +25,34 @@ def client_metrics(rows: list[dict]) -> tuple[float, float]:
     """Returns (mean_latency_ms, throughput_ops_per_sec)."""
     if not rows:
         return 0.0, 0.0
-    latencies = []
+    latencies: list[float] = []
+    times: list[float] = []
+
     for r in rows:
         rt = r.get("response_time") or r.get("response time")
         qt = r.get("request_time") or r.get("request time")
-        if rt and qt:
-            try:
-                latencies.append(float(rt) - float(qt))
-            except ValueError:
-                pass
+        # Some CSV rows have request_time = 0 for "background" samples.
+        # Only treat rows with a real request timestamp as latency data.
+        try:
+            rt_f = float(rt) if rt not in (None, "") else None
+            qt_f = float(qt) if qt not in (None, "") else None
+        except ValueError:
+            rt_f = None
+            qt_f = None
+
+        if qt_f and rt_f and qt_f > 0.0:
+            latencies.append(rt_f - qt_f)
+            # For duration, use only timestamps from rows with a real request_time,
+            # so we don't drag min() down to 0 and make duration enormous.
+            times.append(qt_f)
+            times.append(rt_f)
+
     if not latencies:
         return 0.0, 0.0
+
     mean_latency = sum(latencies) / len(latencies)
     completed = len(latencies)
-    times = []
-    for r in rows:
-        for k in ("request_time", "request time", "response_time", "response time"):
-            if r.get(k):
-                try:
-                    times.append(float(r[k]))
-                    break
-                except ValueError:
-                    pass
+
     duration_sec = (max(times) - min(times)) / 1000.0 if len(times) >= 2 else 1.0
     throughput = completed / duration_sec if duration_sec > 0 else 0.0
     return mean_latency, throughput

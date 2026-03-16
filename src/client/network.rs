@@ -32,16 +32,22 @@ impl Network {
         network.initialize_connections(servers).await;
         network
     }
-
+    fn resolve(addr: &str) -> SocketAddr {
+        loop {
+            match addr.to_socket_addrs() {
+                Ok(mut addrs) => return addrs.next().unwrap(),
+                Err(_) => {
+                    println!("Waiting for DNS resolution of {addr}...");
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
     async fn initialize_connections(&mut self, servers: Vec<(NodeId, String)>) {
         info!("Establishing server connections");
         let mut connection_tasks = Vec::with_capacity(servers.len());
         for (server_id, server_addr_str) in &servers {
-            let server_address = server_addr_str
-                .to_socket_addrs()
-                .expect("Unable to resolve server IP")
-                .next()
-                .unwrap();
+            let server_address = Self::resolve(server_addr_str);
             let task = tokio::spawn(Self::get_server_connection(*server_id, server_address));
             connection_tasks.push(task);
         }

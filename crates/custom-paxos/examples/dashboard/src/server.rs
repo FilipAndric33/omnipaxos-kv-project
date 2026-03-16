@@ -1,7 +1,7 @@
 use crate::{
+    OmniPaxosLog,
     entry::LogEntry,
     util::{OUTGOING_MESSAGE_PERIOD, TICK_PERIOD, UI_TICK_PERIOD},
-    OmniPaxosLog,
 };
 use omnipaxos::{messages::Message, util::NodeId};
 use omnipaxos_ui::OmniPaxosUI;
@@ -11,6 +11,7 @@ use std::{
 };
 use tokio::{sync::mpsc, time};
 
+#[allow(dead_code)]
 pub struct OmniPaxosServer {
     pub omni_paxos_ui: OmniPaxosUI,
     pub omni_paxos: Arc<Mutex<OmniPaxosLog>>,
@@ -41,16 +42,16 @@ impl OmniPaxosServer {
         let mut op_ui_tick_interval = time::interval(UI_TICK_PERIOD);
         loop {
             tokio::select! {
-                biased;
+                            biased;
 
-                _ = op_tick_interval.tick() => { self.omni_paxos.lock().unwrap().tick(); },
-                _ = outgoing_interval.tick() => { self.send_outgoing_msgs().await; },
-                _ = op_ui_tick_interval.tick() => {
-                    self.omni_paxos_ui.tick(self.omni_paxos.lock().unwrap().get_ui_states());
-                },
-                Some(in_msg) = self.incoming.recv() => { self.omni_paxos.lock().unwrap().handle_incoming(in_msg); },
-                else => { }
-            }
+                            _ = op_tick_interval.tick() => { self.omni_paxos.lock().unwrap().tick(); },
+                            _ = outgoing_interval.tick() => { self.send_outgoing_msgs().await; },
+                            _ = op_ui_tick_interval.tick() => {
+            unreachable!()
+                            },
+                            Some(in_msg) = self.incoming.recv() => { self.omni_paxos.lock().unwrap().handle_incoming(in_msg); },
+                            else => { }
+                        }
         }
     }
 }

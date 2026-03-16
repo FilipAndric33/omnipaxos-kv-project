@@ -8,6 +8,3 @@ members = [
     "examples/kv_store",
     "examples/dashboard",
 ]
-
-[profile.release]
-lto = true

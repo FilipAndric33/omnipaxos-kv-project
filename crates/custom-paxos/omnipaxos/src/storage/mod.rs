@@ -4,20 +4,20 @@ mod state_cache;
 use super::ballot_leader_election::Ballot;
 #[cfg(feature = "unicache")]
 use crate::unicache::*;
-use crate::ClusterConfig;
+use crate::{ClusterConfig, buffers::Request};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt::Debug};
+use std::{error::Error, fmt::Debug, hash::Hash};
 
 /// Type of the entries stored in the log.
-pub trait Entry: Clone + Debug {
+pub trait Entry: Clone + Debug + Request + 'static + Hash {
     #[cfg(not(feature = "serde"))]
     /// The snapshot type for this entry type.
     type Snapshot: Snapshot<Self>;
 
     #[cfg(feature = "serde")]
     /// The snapshot type for this entry type.
-    type Snapshot: Snapshot<Self> + Serialize + for<'a> Deserialize<'a>;
+    type Snapshot: Snapshot<Self> + Send + Serialize + for<'a> Deserialize<'a>;
 
     #[cfg(feature = "unicache")]
     /// The encoded type of some data. If there is a cache hit in UniCache, the data will be replaced and get sent over the network as this type instead. E.g., if `u8` then the cached `Entry` (or field of it) will be sent as `u8` instead.
@@ -123,10 +123,12 @@ pub enum StorageOp<T: Entry> {
 }
 
 /// Trait for implementing the storage backend of Sequence Paxos.
-pub trait Storage<T>
+pub trait Storage<T>: Send + 'static
 where
     T: Entry,
 {
+    fn history_hash(&self) -> u64;
+
     /// **Atomically** perform all storage operations in order.
     /// For correctness, the operations must be atomic i.e., either all operations are performed
     /// successfully or all get rolled back. If the `StorageResult` returns as `Err`, the

@@ -1,15 +1,16 @@
 use crate::{
     ballot_leader_election::{Ballot, BallotLeaderElection},
-    errors::{valid_config, ConfigError},
+    clock::Clock,
+    errors::{ConfigError, valid_config},
     messages::Message,
     sequence_paxos::{Phase, SequencePaxos},
     storage::{Entry, StopSign, Storage},
     util::{
-        defaults::{BUFFER_SIZE, ELECTION_TIMEOUT, FLUSH_BATCH_TIMEOUT, RESEND_MESSAGE_TIMEOUT},
         ConfigurationId, FlexibleQuorum, LogEntry, LogicalClock, NodeId,
+        defaults::{BUFFER_SIZE, ELECTION_TIMEOUT, FLUSH_BATCH_TIMEOUT, RESEND_MESSAGE_TIMEOUT},
     },
-    utils::{ui, ui::ClusterState},
 };
+use log::info;
 #[cfg(any(feature = "toml_config", feature = "serde"))]
 use serde::Deserialize;
 #[cfg(feature = "serde")]
@@ -58,7 +59,11 @@ impl OmniPaxosConfig {
     }
 
     /// Checks all configuration fields and returns the local OmniPaxos node if successful.
-    pub fn build<T, B>(self, storage: B) -> Result<OmniPaxos<T, B>, ConfigError>
+    pub async fn build<T, B>(
+        self,
+        storage: B,
+        clock: Clock<T>,
+    ) -> Result<OmniPaxos<T, B>, ConfigError>
     where
         T: Entry,
         B: Storage<T>,
@@ -71,11 +76,7 @@ impl OmniPaxosConfig {
         Ok(OmniPaxos {
             ble: BallotLeaderElection::with(self.clone().into(), recovered_leader),
             election_clock: LogicalClock::with(self.server_config.election_tick_timeout),
-            resend_message_clock: LogicalClock::with(
-                self.server_config.resend_message_tick_timeout,
-            ),
-            flush_batch_clock: LogicalClock::with(self.server_config.flush_batch_tick_timeout),
-            seq_paxos: SequencePaxos::with(self.into(), storage),
+            seq_paxos: SequencePaxos::with(self.into(), storage, clock).await,
         })
     }
 }
@@ -132,10 +133,11 @@ impl ClusterConfig {
 
     /// Checks all configuration fields and builds a local OmniPaxos node with settings for this
     /// node defined in `server_config` and using storage `with_storage`.
-    pub fn build_for_server<T, B>(
+    pub async fn build_for_server<T, B>(
         self,
         server_config: ServerConfig,
         with_storage: B,
+        clock: Clock<T>,
     ) -> Result<OmniPaxos<T, B>, ConfigError>
     where
         T: Entry,
@@ -145,7 +147,7 @@ impl ClusterConfig {
             cluster_config: self,
             server_config,
         };
-        op_config.build(with_storage)
+        op_config.build(with_storage, clock).await
     }
 }
 
@@ -227,11 +229,9 @@ where
     T: Entry,
     B: Storage<T>,
 {
-    seq_paxos: SequencePaxos<T, B>,
+    pub seq_paxos: SequencePaxos<T, B>,
     ble: BallotLeaderElection,
     election_clock: LogicalClock,
-    resend_message_clock: LogicalClock,
-    flush_batch_clock: LogicalClock,
 }
 
 impl<T, B> OmniPaxos<T, B>
@@ -239,43 +239,14 @@ where
     T: Entry,
     B: Storage<T>,
 {
-    /// Initiates the trim process.
-    /// # Arguments
-    /// * `trim_index` - Deletes all entries up to [`trim_index`], if the [`trim_index`] is `None` then the minimum index accepted by **ALL** servers will be used as the [`trim_index`].
-    pub fn trim(&mut self, trim_index: Option<usize>) -> Result<(), CompactionErr> {
-        self.seq_paxos.trim(trim_index)
-    }
-
-    /// Trim the log and create a snapshot. ** Note: only up to the `decided_idx` can be snapshotted **
-    /// # Arguments
-    /// `compact_idx` - Snapshots all entries < [`compact_idx`], if the [`compact_idx`] is None then the decided index will be used.
-    /// `local_only` - If `true`, only this server snapshots the log. If `false` all servers performs the snapshot.
-    pub fn snapshot(
-        &mut self,
-        compact_idx: Option<usize>,
-        local_only: bool,
-    ) -> Result<(), CompactionErr> {
-        self.seq_paxos.snapshot(compact_idx, local_only)
-    }
-
-    /// Return the decided index. 0 means that no entry has been decided.
-    pub fn get_decided_idx(&self) -> usize {
-        self.seq_paxos.get_decided_idx()
-    }
-
-    /// Return trim index from storage.
-    pub fn get_compacted_idx(&self) -> usize {
-        self.seq_paxos.get_compacted_idx()
-    }
-
     /// Returns the ID of the current leader and whether the node's `Phase` is `Phase::Accepted`.
     ///
     /// If the node's phase is `Phase::Accepted`, this implies that the returned leader is also
     /// in the accepted phase. However, a `Phase::Prepare` or a `false` response does not
     /// necessarily imply that the leader is not in the accepted phase; it only reflects the current
     /// phase of this node.
-    pub fn get_current_leader(&self) -> Option<(NodeId, bool)> {
-        let promised_pid = self.seq_paxos.get_promise().pid;
+    pub async fn get_current_leader(&self) -> Option<(NodeId, bool)> {
+        let promised_pid = self.seq_paxos.get_promise().await.pid;
         if promised_pid == 0 {
             None
         } else {
@@ -285,21 +256,28 @@ where
     }
 
     /// Returns the promised ballot of this node.
-    pub fn get_promise(&self) -> Ballot {
-        self.seq_paxos.get_promise()
+    pub async fn get_promise(&self) -> Ballot {
+        self.seq_paxos.get_promise().await
     }
 
     /// Moves outgoing messages from this server into the buffer. The messages should then be sent via the network implementation.
-    pub fn take_outgoing_messages(&mut self, buffer: &mut Vec<Message<T>>) {
-        self.seq_paxos.take_outgoing_msgs(buffer);
+    pub async fn take_outgoing_messages(&mut self, buffer: &mut Vec<Message<T>>) {
+        self.seq_paxos.take_outgoing_msgs(buffer).await;
         buffer.extend(self.ble.outgoing_mut().drain(..).map(|b| Message::BLE(b)));
     }
 
+    /// Moves outgoing messages from this server into the buffer. The messages should then be sent via the network implementation.
+    pub async fn take_client_outgoing_messages(&mut self, buffer: &mut Vec<Message<T>>) {
+        self.seq_paxos.take_outgoing_client_msgs(buffer).await;
+    }
+
     /// Read entry at index `idx` in the log. Returns `None` if `idx` is out of bounds.
-    pub fn read(&self, idx: usize) -> Option<LogEntry<T>> {
+    pub async fn read(&self, idx: usize) -> Option<LogEntry<T>> {
         match self
             .seq_paxos
             .internal_storage
+            .lock()
+            .await
             .read(idx..idx + 1)
             .expect("storage error while trying to read log entries")
         {
@@ -309,47 +287,59 @@ where
     }
 
     /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.
-    pub fn read_entries<R>(&self, r: R) -> Option<Vec<LogEntry<T>>>
+    pub async fn read_entries<R>(&self, r: R) -> Option<Vec<LogEntry<T>>>
     where
         R: RangeBounds<usize>,
     {
         self.seq_paxos
             .internal_storage
+            .lock()
+            .await
             .read(r)
             .expect("storage error while trying to read log entries")
     }
 
     /// Read all decided entries starting at `from_idx` (inclusive) in the log. Returns `None` if `from_idx` is out of bounds.
-    pub fn read_decided_suffix(&self, from_idx: usize) -> Option<Vec<LogEntry<T>>> {
+    pub async fn read_decided_suffix(&self, from_idx: usize) -> Option<Vec<LogEntry<T>>> {
         self.seq_paxos
             .internal_storage
+            .lock()
+            .await
             .read_decided_suffix(from_idx)
             .expect("storage error while trying to read decided log suffix")
     }
 
     /// Handle an incoming message
-    pub fn handle_incoming(&mut self, m: Message<T>) {
+    pub async fn handle_incoming<E: Fn(T) -> Option<Option<String>>>(
+        &mut self,
+        m: Message<T>,
+        e: E,
+    ) {
         match m {
-            Message::SequencePaxos(p) => self.seq_paxos.handle(p),
+            Message::SequencePaxos(p) => self.seq_paxos.handle(p, e).await,
             Message::BLE(b) => self.ble.handle(b),
         }
     }
 
     /// Returns whether this Sequence Paxos has been reconfigured
-    pub fn is_reconfigured(&self) -> Option<StopSign> {
-        self.seq_paxos.is_reconfigured()
+    pub async fn is_reconfigured(&self) -> Option<StopSign> {
+        self.seq_paxos.is_reconfigured().await
     }
 
     /// Append an entry to the replicated log.
-    pub fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {
-        self.seq_paxos.append(entry)
+    pub async fn append<S: Fn(T) -> Option<Option<String>>>(
+        &mut self,
+        entry: T,
+        s: S,
+    ) -> Result<(), ProposeErr<T>> {
+        self.seq_paxos.append(entry, s).await
     }
 
     /// Propose a cluster reconfiguration. Returns an error if the current configuration has already been stopped
     /// by a previous reconfiguration request or if the `new_configuration` is invalid.
     /// `new_configuration` defines the cluster-wide configuration settings for the **next** cluster.
     /// `metadata` is optional data to commit alongside the reconfiguration.
-    pub fn reconfigure(
+    pub async fn reconfigure(
         &mut self,
         new_configuration: ClusterConfig,
         metadata: Option<Vec<u8>>,
@@ -361,38 +351,35 @@ where
                 metadata,
             ));
         }
-        self.seq_paxos.reconfigure(new_configuration, metadata)
+        self.seq_paxos
+            .reconfigure(new_configuration, metadata)
+            .await
     }
 
     /// Handles re-establishing a connection to a previously disconnected peer.
     /// This should only be called if the underlying network implementation indicates that a connection has been re-established.
-    pub fn reconnected(&mut self, pid: NodeId) {
-        self.seq_paxos.reconnected(pid)
+    pub async fn reconnected(&mut self, pid: NodeId) {
+        self.seq_paxos.reconnected(pid).await
     }
 
     /// Increments the internal logical clock. This drives the processes for leader changes, resending dropped messages, and flushing batched log entries.
     /// Each of these is triggered every `election_tick_timeout`, `resend_message_tick_timeout`, and `flush_batch_tick_timeout` number of calls to this function
     /// (See how to configure these timeouts in `ServerConfig`).
-    pub fn tick(&mut self) {
+    pub async fn tick(&mut self) {
         if self.election_clock.tick_and_check_timeout() {
-            self.election_timeout();
-        }
-        if self.resend_message_clock.tick_and_check_timeout() {
-            self.seq_paxos.resend_message_timeout();
-        }
-        if self.flush_batch_clock.tick_and_check_timeout() {
-            self.seq_paxos.flush_batch_timeout();
+            self.election_timeout().await;
         }
     }
 
     /// Manually attempt to become the leader by incrementing this instance's Ballot. Calling this
     /// function may not result in gainig leadership if other instances are competing for
     /// leadership with higher Ballots.
-    pub fn try_become_leader(&mut self) {
+    pub async fn try_become_leader(&mut self) {
         let mut my_ballot = self.ble.get_current_ballot();
-        let promise = self.seq_paxos.get_promise();
+        let promise = self.seq_paxos.get_promise().await;
         my_ballot.n = promise.n + 1;
-        self.seq_paxos.handle_leader(my_ballot);
+        info!("{}", my_ballot.n);
+        self.seq_paxos.handle_leader(my_ballot).await;
     }
 
     /*** BLE calls ***/
@@ -405,26 +392,12 @@ where
     /// If the heartbeat of a leader is not received when election_timeout() is called, the server might attempt to become the leader.
     /// It is also used for the election process, where the server checks if it can become the leader.
     /// For instance if `election_timeout()` is called every 100ms, then if the leader fails, the servers will detect it after 100ms and elect a new server after another 100ms if possible.
-    fn election_timeout(&mut self) {
-        if let Some(new_leader) = self
-            .ble
-            .hb_timeout(self.seq_paxos.get_state(), self.seq_paxos.get_promise())
-        {
-            self.seq_paxos.handle_leader(new_leader);
-        }
-    }
-
-    /// Returns the current states of the OmniPaxos instance for OmniPaxos UI to display.
-    pub fn get_ui_states(&self) -> ui::OmniPaxosStates {
-        let mut cluster_state = ClusterState::from(self.seq_paxos.get_leader_state());
-        cluster_state.heartbeats = self.ble.get_ballots();
-
-        ui::OmniPaxosStates {
-            current_ballot: self.ble.get_current_ballot(),
-            current_leader: self.get_current_leader().map(|(leader, _)| leader),
-            decided_idx: self.get_decided_idx(),
-            heartbeats: self.ble.get_ballots(),
-            cluster_state,
+    async fn election_timeout(&mut self) {
+        if let Some(new_leader) = self.ble.hb_timeout(
+            self.seq_paxos.get_state(),
+            self.seq_paxos.get_promise().await,
+        ) {
+            self.seq_paxos.handle_leader(new_leader).await;
         }
     }
 }

@@ -8,8 +8,27 @@ x-common-variables: &common-server-variables
   OMNIPAXOS_NODE_ADDRS: "s1:8000,s2:8000,s3:8000" # Overwrite node_addrs in cluster config TOML
   OMNIPAXOS_LISTEN_ADDRESS: "0.0.0.0"             # Overwrite listen_address in server config TOMLs
   OMNIPAXOS_LISTEN_PORT: 8000                     # Overwrite listen_port in server config TOMLs
+  # In Docker the clients connect to the proxy (p1). The proxy itself connects to each server
+  # and registers as a single "client" connection.
+  OMNIPAXOS_NUM_CLIENTS: 1                        # Overwrite num_clients in server config TOMLs
 
 services:
+  p1:
+    image: nezha-proxy
+    build:
+      context: ./..
+      dockerfile: proxy.dockerfile
+    container_name: p1
+    depends_on:
+      - s1
+      - s2
+      - s3
+    environment:
+      RUST_LOG: "debug"
+      PROXY_CONFIG_FILE: "/app/proxy-config.toml"
+    volumes:
+      - ./proxy-1-config.toml:/app/proxy-config.toml
+      - ./logs/:/app/logs/
   s1:
     image: omnipaxos-server
     build:
@@ -49,7 +68,7 @@ services:
     environment:
       RUST_LOG: "debug"
       CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s1:8000" # Overwrite server_address in client config TOML
+      OMNIPAXOS_SERVER_ADDRESS: "p1:8080" # Overwrite server_address in client config TOML
     volumes:
       - ./client-1-config.toml:/app/client-config.toml
       - ./logs/:/app/logs/
@@ -59,7 +78,7 @@ services:
     environment:
       RUST_LOG: "debug"
       CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
+      OMNIPAXOS_SERVER_ADDRESS: "p1:8080" # Overwrite server_address in client config TOML
     volumes:
       - ./client-2-config.toml:/app/client-config.toml
       - ./logs/:/app/logs/

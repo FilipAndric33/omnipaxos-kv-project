@@ -45,6 +45,3 @@ macros = ["omnipaxos_macros"]
 unicache = ["lru", "num-traits", "linked_hash_set"]
 
 default = ["macros"]
-
-[profile.release]
-lto = true

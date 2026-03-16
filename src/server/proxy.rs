@@ -14,7 +14,11 @@ pub struct Proxy {
 }
 
 pub enum ProxyCommand {
-    ForwardClientMessage { from: ClientId, msg: ClientMessage },
+    ForwardClientMessage {
+        coordinator_id: NodeId,
+        client_id: ClientId,
+        msg: ClientMessage,
+    },
     HandleClockRequest { from: NodeId },
 }
 
@@ -31,15 +35,20 @@ impl Proxy {
             info!("Proxy actor started on leader {id}");
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    ProxyCommand::ForwardClientMessage { from, msg } => {
+                    ProxyCommand::ForwardClientMessage {
+                        coordinator_id,
+                        client_id,
+                        msg,
+                    } => {
+                        let forward = ClusterMessage::ForwardedClientMessage {
+                            coordinator_id,
+                            client_id,
+                            msg: msg.clone(),
+                        };
                         for (peer_id, ref outbox) in &peer_senders {
-                            let forward = ClusterMessage::ForwardedClientMessage {
-                                client_id: from,
-                                msg: msg.clone(),
-                            };
-                            if let Err(err) = outbox.send(forward) {
+                            if let Err(err) = outbox.send(forward.clone()) {
                                 warn!(
-                                    "Proxy: couldn't forward client {from}'s message to \
+                                    "Proxy: couldn't forward client {client_id}'s message to \
                                      replica {peer_id}: {err}"
                                 );
                             }
@@ -47,10 +56,11 @@ impl Proxy {
                     }
 
                     ProxyCommand::HandleClockRequest { from } => {
+                        // Send LeaderTime(requester_id) so the peer replies with ClockResponse to us (the leader).
                         if let Some((_, outbox)) = peer_senders
                             .iter()
-                            .find(|(id, _)| *id == from) {
-                                let msg: ClusterMessage = ClusterMessage::LeaderTime(from);
+                            .find(|(pid, _)| *pid == from) {
+                                let msg: ClusterMessage = ClusterMessage::LeaderTime(id);
                                 if let Err(err) = outbox.send(msg) {
                                     warn!("Proxy: couldn't send message to node {from} {err}");
                                 }
@@ -71,10 +81,12 @@ impl Proxy {
     }
 
     #[inline]
-    pub fn forward_client_message(&self, from: ClientId, msg: ClientMessage) {
-        let _ = self
-            .sender
-            .send(ProxyCommand::ForwardClientMessage { from, msg });
+    pub fn forward_client_message(&self, coordinator_id: NodeId, client_id: ClientId, msg: ClientMessage) {
+        let _ = self.sender.send(ProxyCommand::ForwardClientMessage {
+            coordinator_id,
+            client_id,
+            msg,
+        });
     }
 
     #[inline]

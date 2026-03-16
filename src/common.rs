@@ -25,9 +25,16 @@ pub mod messages {
             real_time: SystemTime
         },
         ForwardedClientMessage {
+            coordinator_id: NodeId,
             client_id: ClientId,
-            msg: ClientMessage
-        }
+            msg: ClientMessage,
+        },
+        /// Replica sends this to leader so the node with the client connection is the coordinator.
+        ClientMessageForLeader {
+            coordinator_id: NodeId,
+            client_id: ClientId,
+            msg: ClientMessage,
+        },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
